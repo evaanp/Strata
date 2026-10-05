@@ -127,6 +127,39 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
+bool NativeDense::served_layer_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                                     std::vector<uint64_t>& per_layer, std::string& err) {
+    if (n_layers < 0) { err = "native dense: a negative layer count"; return false; }
+    per_layer.assign((size_t) n_layers, 0);
+    try {
+        for (const auto& path : shards) {
+            strata::GgufFile gguf(path);
+            for (const auto& tensor : gguf.tensors()) {
+                if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported(tensor.type) ||
+                    tensor.shape.size() != 2)
+                    continue;
+                const int64_t l = strata::core::tensor_layer(tensor.name);
+                if (l < 0) continue;
+                if (l >= n_layers) {
+                    err = "native dense: " + tensor.name + " is layer " + std::to_string(l) +
+                          ", beyond the model's " + std::to_string(n_layers) + " layers";
+                    return false;
+                }
+                if (tensor.shape[0] > (uint64_t) INT_MAX || tensor.shape[1] > (uint64_t) INT_MAX) {
+                    err = "native dense: " + tensor.name + " is wider than the kernels take";
+                    return false;
+                }
+                per_layer[(size_t) l] += strata::kernels::native_mmvq_weight_bytes(
+                    tensor.type, (int) tensor.shape[0], (int) tensor.shape[1]);
+            }
+        }
+        return true;
+    } catch (const std::exception& error) {
+        err = std::string("native dense: ") + error.what();
+        return false;
+    }
+}
+
 void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 // The byte walk `load` does for the layers [lb, le), without the allocations: the same filters in the same order,
 // reading the GGUF headers and the canonical table only, so it needs no device.  A later stage's projections are not

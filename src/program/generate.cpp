@@ -3069,6 +3069,67 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // ---- THE RANGE CARVE, PRICED.  A stage that runs [lb, le) holds that range's dense weights and no others,
+    // and `layer_bytes` / `served_layer_bytes` read that cost out of the pack's index and the GGUF headers
+    // alone - the same "priced before it is allocated" rule the session carve already follows, and what lets
+    // the search below subtract it.  Before this, EVERY stage held the whole model's dense weights: a card
+    // running 9 of 48 layers was holding 39 layers' worth of projections it can never reach.
+    //
+    // It is read HERE, before the split search and before `--split-skip-if-fits`, because that decision is a
+    // VRAM measurement on CUDA0 whose weights are no longer resident when it is taken (`full_dense` below).
+    //
+    // STRATA_WEIGHT_SLICE=0 disables the carve everywhere, so one binary runs both arms of the A/B.
+    const bool weight_slice = []() {
+        const char* v = std::getenv("STRATA_WEIGHT_SLICE");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    std::vector<uint64_t> wt_layer;             // dense bytes per layer: canonical arena + native projections
+    uint64_t wt_global = 0;                     // what EVERY range also holds: the head, the embedding
+    uint64_t wt_routers = 0;                    // the routers CUDA0 holds whatever its range (see `router_keep`)
+    // CS-T's file-tier lookahead reads EVERY layer's router out of CUDA0's table to warm the next layer's
+    // pages, and a dropped row has `data == nullptr`: the copy fails, `ok` goes false, and the lookahead turns
+    // itself off without saying so.  Keeping all 48 is 120 MiB and is cheaper than losing the prefetch.
+    std::set<std::string> router_keep;
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        router_keep.insert("blk." + std::to_string(l) + ".ffn_gate_inp.weight");
+    if (multi_gpu) {
+        std::vector<uint64_t> canon, native_;
+        if (!strata::core::WeightTable::layer_bytes(o.pack, g.n_layers, canon, wt_global, wt_routers, err,
+                                                    skip.empty() ? nullptr : &skip, &router_keep) ||
+            (!o.native_dense_gguf.empty() &&
+             !strata::core::NativeDense::served_layer_bytes(o.native_dense_gguf, o.native_ple_key, g.n_layers,
+                                                            native_, err))) {
+            std::fprintf(stderr, "strata generate: layer split: the weight carve cannot price itself: %s\n",
+                         err.c_str());
+            return 1;
+        }
+        wt_layer.assign((size_t) g.n_layers, 0);
+        for (int64_t l = 0; l < g.n_layers; ++l) wt_layer[(size_t) l] = canon[(size_t) l];
+        for (size_t l = 0; l < native_.size() && l < wt_layer.size(); ++l) wt_layer[l] += native_[l];
+    }
+    auto range_bytes = [&](int64_t lo, int64_t hi) -> uint64_t {
+        if (lo < 0) lo = 0;
+        if (hi > (int64_t) wt_layer.size()) hi = (int64_t) wt_layer.size();
+        uint64_t sum = 0;
+        for (int64_t l = lo; l < hi; ++l) sum += wt_layer[(size_t) l];
+        return sum;
+    };
+    // THE WHOLE MODEL - what every stage loads when the carve is off, and what CUDA0 alone would need to run
+    // without a split at all (`--split-skip-if-fits`).
+    const uint64_t full_dense = wt_global + wt_routers + range_bytes(0, (int64_t) wt_layer.size());
+    // WHAT A STAGE HOLDING [lo, hi) SPENDS ON WEIGHTS.  Priced with the carve OFF as well, and that is not
+    // symmetry for its own sake: the weights load after the split search in BOTH arms, so `stage_room` has
+    // already measured the VRAM they are about to take.  `weight_slice` decides only WHICH bytes.
+    auto weight_bytes = [&](int64_t lo, int64_t hi) -> uint64_t {
+        if (wt_layer.empty()) return 0;   // no split at all: nothing is loaded after the search
+        return weight_slice ? wt_global + range_bytes(lo, hi) : full_dense;
+    };
+    // CUDA0's own, which also carries every router.
+    auto cuda0_bytes = [&](int64_t lo, int64_t hi) -> uint64_t {
+        if (wt_layer.empty()) return 0;
+        return weight_slice ? wt_global + wt_routers + range_bytes(lo, hi) : full_dense;
+    };
+
     // ---- --split-skip-if-fits: before any later stage loads, does CUDA0 alone hold every profiled pair?  What it
     // still has to allocate on one GPU is the whole session (the KV of every layer), the drafter and the head
     // (kDrafterMib below), the verify windows and the reserve; the prompt path borrows from the cache.  If the
@@ -5060,6 +5121,8 @@ int main(int argc, char** argv) {
                 planned.push_back({HelperTier{remote_dev[r], o.expert_cache_remote[(size_t) r], -1,
                                               o.expert_cache_remote_auto[(size_t) r]},
                                    &by_device[(size_t) r]});
+        }
+        std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
         for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
             for (const auto& pr : st->profile)
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
@@ -7353,7 +7416,7 @@ int main(int argc, char** argv) {
             strata::core::ConversationStageSet s;
             s.stages.push_back({&ss, -1});
             for (auto& st : stages) s.stages.push_back({&st->ss, st->dev});
-            s.draft = &mtp.kv_state();
+            s.draft = &mtp.kv_state_rw();   // parking restores INTO it; #646 split the accessor
             return s;
         };
         auto park_disk = [&]() {
