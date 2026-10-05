@@ -4,7 +4,9 @@
 #include "conversation_copy.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
+#include <climits>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -132,6 +134,24 @@ std::array<uint64_t, 5> kept_bytes(int64_t cells, int64_t page_size, const Sizes
                          : cells ? (uint64_t(sizes[i]) / uint64_t(cells)) * uint64_t(whole_cells) : 0;
     return kept;
 }
+
+// Bytes [at, at + n) of K/V array `i` (pools() order) in the state's memory: `f(state_offset, done, len)` for each
+// piece. A shared KV pool keeps a session's host blocks in chunks (kv_stream.hpp), so a piece ends where a chunk
+// ends; without one the bytes are one piece at `at`. `total` and `cells` size the array: bytes per block from them.
+template <class F>
+bool each_piece(const QsaState& st, size_t i, size_t total, int64_t cells, int64_t page_size, size_t at, size_t n,
+                F&& f) {
+    if (i >= 4 || st.kv_mode == 0 || st.host.chunk_host == nullptr || cells <= 0) return f(at, size_t(0), n);
+    const size_t block = total / size_t(cells / page_size);
+    for (size_t done = 0; done < n;) {
+        const size_t pos = at + done, in = pos % block;
+        const long long b = (long long) (pos / block);
+        const size_t len = std::min((size_t) st.host.contiguous(b, LLONG_MAX) * block - in, n - done);
+        if (!f((size_t) st.host.block_host(b) * block + in, done, len)) return false;
+        done += len;
+    }
+    return true;
+}
 } // namespace
 
 bool conversation_kv_extent(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
@@ -199,7 +219,9 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                return each_piece(st, i, sizes[i], l.cells, l.page_size, at, n, [&](size_t off, size_t done, size_t len) {
+                    return transfer(p + done, src[i] ? static_cast<const uint8_t*>(src[i]) + off : nullptr, len, error);
+                });
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
@@ -234,7 +256,10 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     const auto dst = pools(st);
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return each_piece(st, i, src[i]->size(), image.cells, image.page_size, at, n,
+                                  [&](size_t off, size_t done, size_t len) {
+                    return transfer(static_cast<uint8_t*>(dst[i]) + off, p + done, len, error);
+                });
             })) return false;
     return conversation_kv_restored(st, g, upto, error);
 }
@@ -306,7 +331,10 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
+                return each_piece(st, i, saved[i]->size(), image.cells, image.page_size, at, n,
+                                  [&](size_t off, size_t done, size_t len) {
+                    return compare(static_cast<const uint8_t*>(authoritative[i]) + off, p + done, len, true);
+                });
             })) return false;
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
