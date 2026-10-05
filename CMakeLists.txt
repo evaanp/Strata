@@ -967,7 +967,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
+<<<<<<< HEAD
   # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
+=======
+  # the verify window's one-launch forms (Q4_0 K/V append, hyper-connection write, PLE post-ops with the commit's
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)
   target_include_directories(verify_batch_parity PRIVATE ${_strata_gpu_include_directories})

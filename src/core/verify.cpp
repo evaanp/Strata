@@ -578,11 +578,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: event create failed";
         return false;
     }
+<<<<<<< HEAD
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
         // stage's window with the branches stopped inside its graph when an NVML query (nvidia-smi) came between
         // requests (2x RTX 3090 and 2x RTX 2080 Ti, #905); never seen on Windows.  0 / unset: one stream, as before
         const char* v = std::getenv("STRATA_DF_BRANCH");
         df_branch_ = v != nullptr && std::atoi(v) != 0;
+=======
+    {   // STRATA_DF_BRANCH (CUDA: default on; HIP: STRATA_DF_BRANCH=1, not measured there); 0: one stream, as before
+        const char* v = std::getenv("STRATA_DF_BRANCH");
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        df_branch_ = v != nullptr && std::atoi(v) != 0;
+#else
+        df_branch_ = v == nullptr || std::atoi(v) != 0;
+#endif
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
         if (df_branch_ && df_fork_ == nullptr) {
             bool okb = cudaEventCreateWithFlags(&df_fork_, cudaEventDisableTiming) == cudaSuccess;
             for (int i = 0; i < 2 && okb; ++i)
@@ -703,6 +713,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         ~PdlScope() { pdl_scope() = prev; }
     } pdl_window(G == 1 && pdl_supported());
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
     // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
@@ -716,8 +729,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         cudaEventRecord(df_join_[i], df_side_[i]);
         cudaStreamWaitEvent(cs, df_join_[i], 0);
     };
+<<<<<<< HEAD
 =======
 >>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
+=======
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
@@ -839,12 +855,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
             }
+<<<<<<< HEAD
             // STRATA_DF_PLE (opt-in: STRATA_DF_PLE=1): the window's post-projection steps in one pass, bitwise the per-token loop
+=======
+            // STRATA_DF_PLE (default on): the window's post-projection steps in one pass, bitwise the per-token loop
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
             // below (the norms divide at run time as its norms do; the history advances token by token), which also
             // writes the commit's history snapshots.  Scratch: layer 0's expert rows, combined by now, and the
             // hyper-connection read's `lo_`, which the read below rewrites.
             static const bool ple_post_env = [] {
                 const char* e = std::getenv("STRATA_DF_PLE");
+<<<<<<< HEAD
                 return e != nullptr && std::atoi(e) != 0;
             }();
             const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
@@ -852,6 +873,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
             if (ple_post) {
+=======
+                return !e || std::atoi(e) != 0;
+            }();
+            if (ple_batch_kv && ple_post_env && !batch_rec_) {
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                 float* qn = parts_ + (size_t) tb * K * N;           // n x 10240 (K * N = 25600 per row)
                 float* gated = hit_out_ + (size_t) tb * K * N;      // n x 10240
                 float* pgate = lo_ + (size_t) tb * g.hc_lr;         // n x 4
@@ -912,7 +938,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)));
         };
+<<<<<<< HEAD
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+=======
+        gr_read_group(0, pending, inj2_, inj_);
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
         if (inputs_pending) {   // the window's steps and positions, before the first mixer reads them
             join(1);
             inputs_pending = false;
@@ -950,7 +980,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 float* hb = h_L_ + (size_t) gi * MT * C;
                 float* gate = gate_L_ + (size_t) gi * MT * HV;
                 float* beta = beta_L_ + (size_t) gi * MT * HV;
+<<<<<<< HEAD
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+=======
+                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                 if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
                     fork(0);
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
@@ -960,7 +994,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
                 }
+<<<<<<< HEAD
                 mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+=======
+                native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1029,6 +1067,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (native_rope_enabled()) native_rope_apply(data, data, rows, cols, (int) s.n_rot, rope_scaling(), pos, sx);
                     else rope_neox_apply(data, data, rows, cols, (int) s.n_rot, st.cos_tab, st.sin_tab, pos, sx);
                 };
+<<<<<<< HEAD
                 // #783 PR-f (stuchapin909): the per-head RMSNorm and the rope in one launch, bit-identical to the pair
                 // (rope_parity check 6); STRATA_NO_NORM_ROPE=1 keeps the two; off on HIP until its parity check passes
                 const bool fuse_nr = native_qsa_enabled() && native_rope_enabled() && native_norm_rope_usable((int) HD, (int) s.n_rot);
@@ -1038,11 +1077,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                  rope_scaling(), pos, cs);
                         return;
                     }
+=======
+                auto norm_rope = [&](float* data, const WeightRef* norm, int rows, int cols, const int32_t* pos) {
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                     norm_rope_on(data, norm, rows, cols, pos, cs);
                 };
                 float* idx_raw = idx_raw_L_ + (size_t) qi * MT * ID;
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
+<<<<<<< HEAD
                 // STRATA_DF_QB_Q4 (opt-in: STRATA_DF_QB_Q4=1): a Q4_0 KV cache too - its one per-token extra, the query's rotation, is
                 // row-wise and the batched path rotates (270650e); 0: Q4_0 token by token, as before
                 static const bool qb_q4 = [] {
@@ -1051,6 +1094,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+=======
+                // STRATA_DF_QB_Q4 (default on): a Q4_0 KV cache too - its one per-token extra, the query's rotation, is
+                // row-wise and the batched path rotates (270650e); 0: Q4_0 token by token, as before
+                static const bool qb_q4 = [] {
+                    const char* e = std::getenv("STRATA_DF_QB_Q4");
+                    return !e || std::atoi(e) != 0;
+                }();
+                const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
+                native_quantize_q8_1(xm, xq_, (int) N, n, cs);
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
                 const bool qbr = br && qb;
@@ -1089,6 +1142,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                              slot_ss(t).qsa_states[qi].idx_tail, TS, cs);
                 } else
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
+<<<<<<< HEAD
                 // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
                 // batch's rows each have their own K/V, so that case keeps the loop)
                 if (dec_batch && !g_no_batch_kv && !batch_rec_) {
@@ -1116,6 +1170,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
                                            kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
                 } else
+=======
+                // STRATA_DF_KVAPP (default on): a Q4_0 window's K/V cells in one launch (the same stores); 0: per token
+                static const bool kv_multi = [] {
+                    const char* e = std::getenv("STRATA_DF_KVAPP");
+                    return !e || std::atoi(e) != 0;
+                }();
+                if (kv_multi && n > 1 && !batch_rec_ && st.kv_q4 && !st.kv_hybrid)
+                    kv_append_q4_step_multi(st.k_q4, st.v_q4, st.page_table, step_ + tb * kStepCount, kcur_ + tb * NKV * HD,
+                                            vcur_ + tb * NKV * HD, n, s, cs, &st.host);
+                else
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                 for (int t = tb; t < te; ++t) {
                     const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
                     const int32_t* step_t = step_ + t * kStepCount;
@@ -1152,6 +1217,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 9, grp);
 <<<<<<< HEAD
+<<<<<<< HEAD
                 if (qbr) {
                     join(1);   // the indexer query, for the block scores
                 } else {
@@ -1164,6 +1230,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     } else {
                     // the q/gate split as a copy kernel: the window's chain stays kernel to kernel (PDL)
 =======
+=======
+                if (qbr) {
+                    join(1);   // the indexer query, for the block scores
+                } else {
+>>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
                 native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
                             n, cs);
                 if (qb) {   // the q/gate split as a copy kernel: the window's chain stays kernel to kernel
