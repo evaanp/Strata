@@ -1,4 +1,4 @@
-# Strata Engine - top-level build (P1.S1).
+﻿# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -473,6 +473,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/remote_budget_test.cpp")
+    # The helper tiers' pair selection (the spill tier a layer split opens on every card).  No GPU: the walk is
+    # pure arithmetic, and CUDA_VISIBLE_DEVICES=-1 keeps a stray context from being created for the link alone.
+    add_executable(remote_budget_test tests/core/remote_budget_test.cpp)
+    target_link_libraries(remote_budget_test PRIVATE strata_engine)
+    add_test(NAME remote_budget_test COMMAND remote_budget_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
+    set_tests_properties(remote_budget_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
   endif()
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
