@@ -56,6 +56,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
+#include "strata/core/penalty_hist.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -10427,6 +10428,7 @@ int main(int argc, char** argv) {
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            strata::core::PipePenalty book{consumed, hist_n, hist_stage};
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
@@ -10461,7 +10463,6 @@ int main(int argc, char** argv) {
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap2[0] != nullptr;
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -10913,6 +10914,22 @@ int main(int argc, char** argv) {
                     if (A.finished && !A.s1) {
                         if (chain_kind == 1 && !B.ready) ++pl_late;   // stage 0 idles until the chain has B
                         if (ajob) a_gap(1);   // --adapt-async: stage 1 is idle until this launch
+                        if (hist_n > 0) {
+                            // the penalty tails, one row per window row, staged on the stage's stream ahead of
+                            // the window: the SAME bytes the serial loop stages for this window.  `consumed`
+                            // ends at the token before A.tok[0] at this line (a speculative B reaches it only
+                            // once its guess is proven, so the assumption is the truth there; a rejected
+                            // speculative window never runs stage 1 and never reads the buffer, so it needs no
+                            // rebuild - the next on-path window re-stages from the real tokens).  Nothing else
+                            // can sample: pl_finish samples and syncs before its picks are read, and A's own
+                            // sampling launches on this stream, after this copy.
+                            const int32_t* rows = book.stage(A.tok, A.T);
+                            const strata::core::OnDevice on_h(hist_dev);
+                            if (cudaMemcpyAsync(d_hist, rows,
+                                                (size_t) A.T * (size_t) hist_n * sizeof(int32_t),
+                                                cudaMemcpyHostToDevice, V1(A).stream()) != cudaSuccess)
+                                return die("the penalty-history copy failed");
+                        }
                         if (!V1(A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.s1 = true;
                         tre("L1", A.seq, A.T);
@@ -10929,7 +10946,7 @@ int main(int argc, char** argv) {
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
-                    for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
+                    book.commit(A.tok, a);
                     draft_offered += A.T - 1;
                     draft_accepted += a;
                     ++rounds;
@@ -11125,11 +11142,9 @@ int main(int argc, char** argv) {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
-                                                  hist_n, hist_stage.data());
+                    const int32_t* rows = book.stage(window.data(), T);
                     const strata::core::OnDevice on_h(hist_dev);
-                    cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
-                               cudaMemcpyHostToDevice);
+                    cudaMemcpy(d_hist, rows, (size_t) T * (size_t) hist_n * sizeof(int32_t), cudaMemcpyHostToDevice);
                 }
                 // the elastic K/V: the window's cells and the drafter's beyond them
                 if (kvg.on && p + T + 64 > kvg.cells &&
@@ -11168,7 +11183,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                book.commit(window.data(), a);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
