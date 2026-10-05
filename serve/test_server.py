@@ -4421,6 +4421,12 @@ class TokenizerRoutes(unittest.TestCase):
         self.assertEqual(self.post("/tokenize", {"content": "xab<|im_end|>"}),
                          (200, {"tokens": [ord("x"), MergingTokenizer.AB, 257]}))
 
+    def test_tokenize_counts_a_lone_surrogate_instead_of_refusing(self):
+        # PLA's in-turn fold counts text in which an emoji was cut in half (one UTF-16 half survives); a 400 there
+        # made it fall back to a characters / 4 estimate exactly when the window fit mattered (2026-10-03)
+        status, body = self.post("/tokenize", {"content": "x\ud83dy"})
+        self.assertEqual((status, len(body["tokens"])), (200, 3))
+
     def test_tokenize_with_pieces(self):
         self.assertEqual(self.post("/tokenize", {"content": "ab", "with_pieces": True}),
                          (200, {"tokens": [{"id": MergingTokenizer.AB, "piece": "ab"}]}))

@@ -4996,7 +4996,15 @@ def make_handler(svc: Service):
                 content = req.get("content")
                 if not isinstance(content, str):
                     raise ValueError("'content' must be a string")
-                ids = svc.tok.encode(content, parse_special=req.get("parse_special", True) is not False)
+                # JSON may carry half of a surrogate pair (a client that cut a string inside an emoji: PLA's in-turn
+                # fold did, and a 400 here made it estimate characters / 4 exactly when the window fit mattered).
+                # Count it as one replacement character, and say where it was so the client can be fixed.
+                clean = content.encode("utf-8", "replace").decode("utf-8")
+                if clean != content:
+                    at = next(i for i, c in enumerate(content) if 0xD800 <= ord(c) <= 0xDFFF)
+                    print(f"[strata] /tokenize: a lone surrogate at {at} of {len(content)}, counted as one character: "
+                          f"{content[max(0, at - 60):at + 20].encode('utf-8', 'backslashreplace').decode()!r}", flush=True)
+                ids = svc.tok.encode(clean, parse_special=req.get("parse_special", True) is not False)
                 if req.get("with_pieces"):
                     self._json(200, {"tokens": [{"id": t, "piece": svc.tok.decode([t])} for t in ids]})
                 else:
