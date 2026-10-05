@@ -3343,7 +3343,15 @@ class Service:
                     last_print = time.time()
                     conversation = str((sampling or {}).get("strata_conversation") or "")
                     prompt, thought = self.tails.splice(conversation, ids, self.tok), 0   # thought: the reasoning
-                    for ev in opening:                                                    # tokens so far (the budget's)
+                    # thought: the reasoning tokens so far (the budget's).  The budget was cut for `ids`; a
+                    # splice that puts back more sampled ids than the tokenizer's merges makes the prompt longer,
+                    # and a client that asks for exactly the room left (PLA does) then went over by those few
+                    # tokens: the engine refused the request (conv 60158, 2026-10-03:
+                    # 51349 + 102244 + 8 > 153600).  Give them up from max_new.
+                    over = len(prompt) + max_new + CTX_SLACK - getattr(self.engine, "max_context", 1 << 62)
+                    if over > 0 and len(prompt) > len(ids):
+                        max_new -= min(over, len(prompt) - len(ids))
+                    for ev in opening:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)

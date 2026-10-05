@@ -4341,6 +4341,15 @@ class MergingTokenizer(ByteTokenizer):
         return b"".join(self.token_bytes(t) for t in ids).decode("utf-8", errors=errors)
 
 
+class ContextCheckingEngine(MockEngine):
+    """Refuses prompt + max_new + CTX_SLACK > context, as `strata --serve` does (its ERR line is a ValueError)."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if len(ids) + max_new + CTX_SLACK > self.max_context:
+            raise ValueError(f"prompt ({len(ids)} tokens) + max_new ({max_new}) exceeds the context ({self.max_context})")
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
 class SampledIds(unittest.TestCase):
     """A split the model sampled ("a", "b") comes back as the tokenizer's merge ("ab"): the next prompt must carry
     the sampled ids, or it stops continuing the engine's live end (a re-read of thousands of tokens on strata)."""
@@ -4349,7 +4358,7 @@ class SampledIds(unittest.TestCase):
         self.tok = MergingTokenizer()
         sampled = self.tok.encode("\n</think>\n\n", parse_special=True) + [ord("a"), ord("b")] + \
             self.tok.encode("<|im_end|>", parse_special=True)
-        self.engine = MockEngine(self.tok, "unused", max_context=CTX)
+        self.engine = ContextCheckingEngine(self.tok, "unused", max_context=CTX)
         self.engine.scripts = [sampled]
         self.engine.script = sampled
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
@@ -4377,6 +4386,16 @@ class SampledIds(unittest.TestCase):
     def test_the_next_prompt_carries_the_sampled_ids(self):
         live, prompt = self.two_turns()
         self.assertEqual(prompt[:len(live)], live)
+
+    def test_a_longer_spliced_prompt_still_fits_a_budget_that_fills_the_context(self):
+        # PLA asks for exactly the room left (context - prompt - slack); the splice puts back 2 sampled ids for the
+        # 1 the tokenizer merges, so the prompt the engine reads is one longer than the one the budget was cut for
+        first = [{"role": "user", "content": "hi"}]
+        self.post("/v1/chat/completions", {"model": "m", "messages": first, "max_tokens": 50})
+        second = first + [{"role": "assistant", "content": "ab"}, {"role": "user", "content": "more"}]
+        n = len(self.tok.encode(self.svc.template.render(second), parse_special=True))
+        body = self.post("/v1/chat/completions", {"model": "m", "messages": second, "max_tokens": CTX - n - CTX_SLACK})
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop", body)
 
     def test_another_conversation_keeps_the_tokenizers_ids(self):
         live, prompt = self.two_turns(second_conversation="c2")
