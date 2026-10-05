@@ -8419,7 +8419,9 @@ int main(int argc, char** argv) {
                 }
             }
             std::printf("INFO context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
-                        "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
+                        "expert_slots_primary=%lld expert_cache_primary_mib=%lld "
+                        "gpu_dev=%s gpu_layers=%s gpu_kv_mib=%s gpu_buf_mib=%s gpu_experts=%s gpu_expert_mib=%s "
+                        "gpu_draft_mib=%s spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld tail_role_token=%lld vram_elastic=%d%s engine=" STRATA_VERSION "\n",
@@ -8428,6 +8430,8 @@ int main(int argc, char** argv) {
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
                         (long long) slots_all, (long long) mib_all,
                         (long long) slots_primary, (long long) mib_primary,
+                        g_dev.c_str(), g_lay.c_str(), g_kv.c_str(), g_buf.c_str(), g_ex.c_str(), g_exm.c_str(),
+                        g_draft.c_str(),
                         o.spec, o.mtp_max_t,
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
