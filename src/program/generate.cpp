@@ -7281,6 +7281,16 @@ int main(int argc, char** argv) {
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             if (!live_conv.empty()) return true;
+            // Hybrid keyless parking parks two entries for one session when RAM allows both: the chain's pinned
+            // root (checks.front(), the end of the system prompt) plus the K/V up to it - what another job can
+            // mount - and, when the live end extends past that root, the full snapshot (the live end, its images
+            // and the chain) so the conversation that comes back with its own tokens continues at its live end
+            // instead of re-reading its tail (read in one go != continued). The prefix goes first: when only one
+            // fits, make_room must not evict the fresh prefix entry for the full snapshot's benefit. An empty
+            // chain means no shared root was ever seen; a root under --prompt-cache-root is cheaper to read
+            // again than to park (root_at's rule); either way only the full snapshot parks, as before.
+            const ConvCheckpoint* keep = checks.empty() ? nullptr : &checks.front();
+            size_t parked_here = 0;   // entries this call stored; a later make_room must not evict them
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(live, live_imgs, checks, cvec_cached))
@@ -7290,113 +7300,150 @@ int main(int argc, char** argv) {
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
             const size_t n_st = stages.size();
+            // under a split the root parks as one part per stage image, so it needs a complete set of them; an
+            // incomplete root only ever comes from a chain the full snapshot's own split moves aside (rest)
+            const bool has_root = keep && keep->ids.size() >= (size_t) o.prompt_cache_root &&
+                                  keep->stage_parts.size() == n_st;
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
             // saved with that stage's image, under its device; stage 0's image holds none
             const strata::core::QsaState* draft0 = n_st > 0 || !use_mtp ? nullptr : &mtp.kv_state();   // no --mtp: no draft K/V (snapshots accept null)
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return use_mtp && k + 1 == n_st ? &mtp.kv_state() : nullptr; };
-            strata::core::ConversationCheckpointSplit cs;
-            if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
-            struct MergeBack {
-                strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
-                ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
-            } merge_back{cs, checks, n_st > 0};
-            const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
-            auto reuse = conversations.take_reuse();
-            std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
-            stage_reuse.resize(n_st);
-            reuse.stages.clear();
-            // the later stages' estimates, each with its own retained K/V when it still fits
-            size_t stage_estimate = 0, stage_retained = 0;
-            for (size_t k = 0; k < n_st; ++k) {
-                auto& st = stages[k];
-                const strata::core::OnDevice on(st->dev);
-                const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                size_t b = 0;
-                if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
-                                 st->dev, err.c_str());
-                    err.clear();
-                    return true;
-                }
-                if (!stage_reuse[k].kv.empty()) {
-                    size_t r = 0;
-                    if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
-                                                                          r, err)) {
-                        b = r;
-                        stage_retained += stage_reuse[k].bytes();
-                    } else {
-                        stage_reuse[k] = {};
-                        err.clear();
-                    }
-                }
-                stage_estimate += b;
-            }
-            size_t estimate = 0;
-            if (!strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
-                err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
-                return true;
-            }
-            const size_t fresh_estimate = estimate;
-            if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
-                    reuse, view, ss, g, draft0, estimate, err)) {
-                reuse = {};
-                estimate = fresh_estimate;
-                err.clear();
-            }
-            estimate += stage_estimate;
-            // A park carrying its own retained K/V replaces memory the cache
-            // already held, so capacity is make_room's call - it runs next either
-            // way, and put()'s accounting still bounds the budget. The with-reuse
-            // estimate must stay uncapped: it counts the retained buffers'
-            // capacity and directories, and put() charges that same true size -
-            // a capped figure would under-evict and overfill the budget.
-            if (!conversations.make_room(estimate, held)) {
-                std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
-                             estimate >> 20);
-                return true;
-            }
-            const auto t0 = Clock::now();
-            try {
-                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
-                const size_t retained = reuse.bytes() + stage_retained;
-                const size_t additional = estimate > retained ? estimate - retained : 0;
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
-                        additional, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
-                                 additional >> 20, (long long) o.conversation_cache_min_free_mib);
-                    return true;
-                }
-                strata::core::SavedConversation image;
-                size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+            // Park one entry for `ids`/`imgs`: with `root` non-null a prefix entry (that checkpoint plus the K/V up
+            // to it, one image per stage), without it the full snapshot. Capacity and RAM misses log their own skip
+            // line; only a failed capture returns false (the caller fails the request). `stored` reports an entry
+            // going into the cache.
+            auto park_view = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
+                                 const ConvCheckpoint* root, size_t protect, bool& stored) -> bool {
+                stored = false;
+                strata::core::ConversationCheckpointSplit cs;
+                if (root == nullptr && n_st > 0)
+                    cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);
+                struct MergeBack {
+                    strata::core::ConversationCheckpointSplit& cs; std::vector<ConvCheckpoint>& checks; bool on;
+                    ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
+                } merge_back{cs, checks, root == nullptr && n_st > 0};
+                const std::vector<ConvCheckpoint> no_chain;
+                const strata::core::ConversationView view{ids, imgs,
+                    root ? no_chain : (n_st > 0 ? cs.stage0 : checks), cvec_cached};
+                auto reuse = conversations.take_reuse();
+                std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
+                stage_reuse.resize(n_st);
+                reuse.stages.clear();
+                // the later stages' estimates, each with its own retained K/V when it still fits
+                size_t stage_estimate = 0, stage_retained = 0;
+                for (size_t k = 0; k < n_st; ++k) {
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                    strata::core::SavedConversation part;
-                    if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
+                    const strata::core::ConversationView view_k{ids, imgs, root ? no_chain : cs.parts[k], cvec_cached};
+                    size_t b = 0;
+                    if (!strata::core::conversation_snapshot_bytes(view_k, st->ss, g, draft_of(k), b, err)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (stage CUDA%d: %s)\n",
+                                     st->dev, err.c_str());
+                        err.clear();
+                        return true;
+                    }
+                    if (!stage_reuse[k].kv.empty()) {
+                        size_t r = 0;
+                        if (strata::core::conversation_snapshot_capture_bytes(stage_reuse[k], view_k, st->ss, g, draft_of(k),
+                                                                              r, err)) {
+                            b = r;
+                            stage_retained += stage_reuse[k].bytes();
+                        } else {
+                            stage_reuse[k] = {};
+                            err.clear();
+                        }
+                    }
+                    stage_estimate += b;
                 }
-                if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
-                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
+                size_t estimate = 0;
+                if (!strata::core::conversation_snapshot_bytes(view, ss, g, draft0, estimate, err)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (%s)\n", err.c_str());
+                    err.clear(); // A recoverable miss must not poison the batched draft prefill's error channel.
                     return true;
                 }
-                const size_t snapshot_bytes = image.bytes();
-                const bool stored = conversations.put(std::move(image), held);
-                std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
-                             stored ? "parked" : "skipped", live.size(),
-                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
-            } catch (const std::bad_alloc&) {
-                // The active state has not been touched. Continue with normal
-                // prompt processing rather than killing a serving process.
-                std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                const size_t fresh_estimate = estimate;
+                if (!reuse.kv.empty() && !strata::core::conversation_snapshot_capture_bytes(
+                        reuse, view, ss, g, draft0, estimate, err)) {
+                    reuse = {};
+                    estimate = fresh_estimate;
+                    err.clear();
+                }
+                estimate += stage_estimate;
+                // A park carrying its own retained K/V replaces memory the cache
+                // already held, so capacity is make_room's call - it runs next either
+                // way, and put()'s accounting still bounds the budget. The with-reuse
+                // estimate must stay uncapped: it counts the retained buffers'
+                // capacity and directories, and put() charges that same true size -
+                // a capped figure would under-evict and overfill the budget.
+                if (!conversations.make_room(estimate, held, protect)) {
+                    std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
+                                 estimate >> 20);
+                    return true;
+                }
+                const auto t0 = Clock::now();
+                try {
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                    const size_t retained = reuse.bytes() + stage_retained;
+                    const size_t additional = estimate > retained ? estimate - retained : 0;
+                    if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(),
+                            additional, floor)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, or telemetry unavailable)\n",
+                                     additional >> 20, (long long) o.conversation_cache_min_free_mib);
+                        return true;
+                    }
+                    strata::core::SavedConversation image;
+                    size_t reused_bytes = 0;
+                    if (root) {
+                        ConvCheckpoint root0 = *root;   // stage 0's part: the chain's root itself, parts aside
+                        root0.stage_parts.clear();
+                        if (!strata::core::conversation_prefix_save(image, root0, ss, g, draft0, cvec_cached, err,
+                                std::move(reuse), &reused_bytes)) return false;
+                    } else if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
+                            std::move(reuse), &reused_bytes)) return false;
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        strata::core::SavedConversation part;
+                        if (root) {
+                            ConvCheckpoint root_part = root->stage_parts[k];   // the root's K/V on this stage's carve
+                            root_part.stage_parts.clear();
+                            if (!strata::core::conversation_prefix_save(part, root_part, st->ss, g, draft_of(k),
+                                    cvec_cached, err, std::move(stage_reuse[k]), &reused_bytes)) return false;
+                        } else {
+                            const strata::core::ConversationView view_k{ids, imgs, cs.parts[k], cvec_cached};
+                            if (!strata::core::conversation_snapshot_save(part, view_k, st->ss, g, draft_of(k), err,
+                                    std::move(stage_reuse[k]), &reused_bytes)) return false;
+                        }
+                        image.stage_images.push_back(std::move(part));
+                    }
+                    if (!strata::core::conversation_memory_admit(strata::core::conversation_available_memory(), 0, floor)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM floor after capture, or telemetry unavailable)\n");
+                        return true;
+                    }
+                    const size_t snapshot_bytes = image.bytes();
+                    stored = conversations.put(std::move(image), held);
+                    std::fprintf(stderr, "strata serve: conversation cache: %s%s%zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
+                                 stored ? "parked" : "skipped", root ? " prefix " : " ",
+                                 root ? root->ids.size() : ids.size(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                } catch (const std::bad_alloc&) {
+                    // The active state has not been touched. Continue with normal
+                    // prompt processing rather than killing a serving process.
+                    std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
+                }
+                return true;
+            };
+            bool stored = false;
+            if (has_root) {
+                if (!park_view(keep->ids, keep->imgs, keep, 0, stored)) return false;
+                if (stored) ++parked_here;
             }
+            // The live end extends past the root: park the whole session too, under the same byte budget and
+            // RAM floor. If it does not fit, its skip line says so and the prefix entry stays.
+            if (live.size() > (has_root ? keep->ids.size() : 0) &&
+                !park_view(live, live_imgs, nullptr, parked_here, stored)) return false;
             return true;
         };
         // ---- disk parking (--conversation-disk-dir): `live_conv` is the id of the conversation the session holds, and
@@ -9457,10 +9504,44 @@ int main(int argc, char** argv) {
                 }
             // Disk parking: another conversation (or none) holds the session, or it is in between after a failed request.
             const bool switching = disk.enabled() && (req_conv != live_conv || !live_ok);
+            // The conversation that holds the session came back without continuing its live end: without this line
+            // the request reads from a checkpoint (or from 0) and nothing says why - the switch below logs its own
+            if (!switching && !req_conv.empty() && !from_live && !live.empty() && o.prompt_cache > 0 &&
+                want_cvec == cvec_cached) {
+                size_t at = 0;
+                const size_t m = std::min(live.size(), ids.size());
+                while (at < m && live[at] == (int32_t) ids[at]) ++at;
+                std::string was, now;
+                for (size_t i = at >= 8 ? at - 8 : 0; i < std::min(live.size(), at + 24); ++i)
+                    was += (i == at ? "|" : i ? "," : "") + std::to_string((long long) live[i]);
+                for (size_t i = at >= 8 ? at - 8 : 0; i < std::min(ids.size(), at + 24); ++i)
+                    now += (i == at ? "|" : i ? "," : "") + std::to_string((long long) ids[i]);
+                std::fprintf(stderr, "strata serve: conversation cache: %s does not continue its live end: diverges "
+                                     "at %zu of %zu (prompt %zu)%s, resuming at %lld; live=%s prompt=%s\n",
+                             req_conv.c_str(), at, live.size(), ids.size(),
+                             at == m ? (m == ids.size() ? " (the prompt is shorter)" : " (pictures differ)") : "",
+                             (long long) resume, was.c_str(), now.c_str());
+            }
             strata::core::ConversationDisk::Match on_disk;
             std::optional<strata::core::SavedConversation> from_disk;
             if (switching && !req_conv.empty() && want_cvec == cvec_cached) {
                 on_disk = disk.best(req_conv, ids, req_imgs, want_cvec);
+                if (on_disk.tokens > 0 && !on_disk.live) {
+                    // the client re-rendered something this conversation generated: say where, with the ids around
+                    // it, so the cause (a template, a parser, a tokenization the model did not produce) can be found
+                    std::vector<int32_t> was;
+                    const size_t at = disk.divergence(req_conv, ids, was);
+                    auto window = [&](auto get, size_t size) {
+                        std::string out;
+                        for (size_t i = at >= 8 ? at - 8 : 0; i < std::min(size, at + 24); ++i)
+                            out += (i == at ? "|" : i ? "," : "") + std::to_string((long long) get(i));
+                        return out;
+                    };
+                    std::fprintf(stderr, "strata serve: conversation disk: %s does not continue its live end: diverges "
+                                         "at %zu of %zu (prompt %zu); live=%s prompt=%s\n", req_conv.c_str(), at,
+                                 was.size(), ids.size(), window([&](size_t i) { return was[i]; }, was.size()).c_str(),
+                                 window([&](size_t i) { return ids[i]; }, ids.size()).c_str());
+                }
                 if (on_disk.tokens > resume) {
                     const auto t0 = Clock::now();
                     from_disk.emplace();
@@ -9599,15 +9680,29 @@ int main(int argc, char** argv) {
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
                 }
-                live = std::move(incoming->live.ids);
-                live_imgs = std::move(incoming->live.imgs);
-                if (stages.empty()) {
-                    checks = std::move(incoming->checkpoints);
-                } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
-                    strata::core::ConversationCheckpointSplit cs;
-                    cs.stage0 = std::move(incoming->checkpoints);
-                    for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
-                    if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                if (parked.live && incoming->prefix) {
+                    // A prefix entry's live part IS the chain's root. The hit consumed the entry, and no new
+                    // root checkpoint is taken for a request that resumes past it (root_at needs read_from 0),
+                    // so handing the payload back to `checks` is what lets the NEXT park re-park the same
+                    // prefix - otherwise the shared root survives exactly one generation. No bytes are
+                    // allocated: this is host memory that would otherwise be freed with the entry.
+                    incoming->live.used = ++check_clock;   // creation advances the LRU clock, as in checkpoint_at
+                    checks.clear();
+                    checks.push_back(std::move(incoming->live));
+                    for (auto& si : incoming->stage_images) checks.back().stage_parts.push_back(std::move(si.live));
+                    live = checks.back().ids;              // 16 KB of ids, not worth a second owner
+                    live_imgs = checks.back().imgs;
+                } else {
+                    live = std::move(incoming->live.ids);
+                    live_imgs = std::move(incoming->live.imgs);
+                    if (stages.empty()) {
+                        checks = std::move(incoming->checkpoints);
+                    } else {   // give each checkpoint back its stage parts (moved, not copied); none if they do not line up
+                        strata::core::ConversationCheckpointSplit cs;
+                        cs.stage0 = std::move(incoming->checkpoints);
+                        for (auto& si : incoming->stage_images) cs.parts.push_back(std::move(si.checkpoints));
+                        if (!strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear();
+                    }
                 }
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
