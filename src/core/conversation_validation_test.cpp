@@ -230,6 +230,107 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(unpublished.kv.empty() && unpublished.live.ids.empty(), "failed incremental capture cannot publish a partial image");
 #endif
 }
+
+// A two-stage split: stage 0 owns layers [0,4) (GDN rows 0..2, QSA ordinal 0), stage 1 owns [4,8)
+// (rows 3..5, ordinal 1). Parking composes one image from per-stage parts: `live` holds stage 0's running
+// state and `stage_images` one SavedConversation per later stage; the K/V is copied by the flat entry list
+// (stage 0's owned layers, then stage 1's, then the drafter on the last stage). `dev` stays -1 outside the
+// transfer build so no CUDA is touched; there each stage gets its own card to show the OnDevice scoping.
+void split_fixture(int format) {
+    ModelGeometry g;
+    g.n_layers = 8; g.n_expert = 256;
+    g.ssm_state_size = 2; g.ssm_v_heads = 2; g.ssm_conv_channels = 8;
+    g.n_head_kv = 1; g.head_dim = 64; g.idx_key_dim = 8;
+    std::string error;
+    ConversationStateSizes z;
+    check(conversation_state_sizes(g, z, error), "split fixture sizing");
+    Pools first(g, format), second(g, format), draft(g, format);
+    std::vector<uint8_t> gdn0(z.gdn / 6 * 3, 0xa5), hist0(z.ple, 0xa5);
+    std::vector<uint8_t> gdn1(z.gdn / 6 * 3, 0xa5), hist1(z.ple, 0xa5);
+    SessionState stage0, stage1;
+    stage0.max_cells = stage1.max_cells = 96;
+    // The QSA table is whole-model: each stage owns a slice of it by ordinal, not its own array.
+    std::array<QsaState, 2> qsa{first.st, second.st};
+    stage0.gdn_state = (float*) gdn0.data(); stage0.ple_hist = (float*) hist0.data(); stage0.qsa_states = qsa.data();
+    stage1.gdn_state = (float*) gdn1.data(); stage1.ple_hist = (float*) hist1.data(); stage1.qsa_states = qsa.data();
+    stage0.layer_hi = 4; stage0.gdn_alloc = 3; stage0.qsa_alloc = 1;                            // QSA ordinal 0
+    stage1.layer_lo = 4; stage1.layer_hi = 8; stage1.gdn_alloc = 3; stage1.qsa_ord0 = 1; stage1.qsa_alloc = 1;   // ordinal 1
+    ConversationStageSet set{{{&stage0, -1}, {&stage1, -1}}};
+    set.draft = &draft.st;
+    const auto entries = conversation_kv_entries(set);
+    check(entries.size() == 3 && entries[0].state == &qsa[0] && entries[1].state == &qsa[1] &&
+          entries[2].state == &draft.st, "flat K/V order: stage 0's layers, then stage 1's, then the drafter");
+    check(entries[0].index && entries[1].index && !entries[2].index,
+          "the drafter is the entry without an indexer; both stages' layers have one");
+    std::vector<int32_t> ids9;
+    for (int32_t i = 1; i <= 9; ++i) ids9.push_back(i);
+    ConversationCheckpoint cp5;   // a retained checkpoint at token 5, as the cache would hold it
+    cp5.ids.assign(ids9.begin(), ids9.begin() + 5);
+    cp5.imgs = {{1, 44}};
+    const ConversationView view{ids9, {{1, 44}}, {cp5}, true};
+    SavedConversation short_image; short_image.stage_images.emplace_back();   // one part for two stages
+    check(!conversation_live_restore(short_image, set, g, error), "a park missing a stage's live state is refused");
+    ConversationStageSet no_draft = set; no_draft.draft = nullptr;
+    SavedConversation none;
+    check(!conversation_live_save(none, view, no_draft, g, error), "a park without a drafter is refused");
+#if defined(CONVERSATION_TEST_TRANSFERS)
+    // Real device numbers here: a -1 device cannot show which card a copy was made on, and the point is that
+    // each stage is drained on its own card before anything there is read or written.
+    set.stages = {{&stage0, 0}, {&stage1, 1}};
+    auto on_stage1 = [&](const void* p) {
+        auto inside = [&](const std::vector<uint8_t>& v) {
+            return p >= (const void*) v.data() && p < (const void*) (v.data() + v.size());
+        };
+        if (inside(gdn1) || inside(hist1)) return true;
+        for (const auto& bytes : second.data) if (inside(bytes)) return true;
+        return false;
+    };
+    reset_counters();
+    SavedConversation image;
+    check(conversation_live_save(image, view, set, g, error), "two-stage live capture through the host backend");
+    check(image.live.ids == ids9 && image.stage_images.size() == 1 && image.stage_images[0].live.ids == ids9,
+          "each stage's live part carries the same conversation");
+    check(image.layer_lo == 0 && image.layer_hi == 4, "the image range is the first stage's carve");
+    bool stage1_read = false, read_after_drain = true;
+    for (const CopyEvent& e : copy_order) {
+        if (e.drains < 1) read_after_drain = false;
+        if (!on_stage1(e.src)) continue;
+        stage1_read = true;
+        if (e.device != 1) read_after_drain = false;   // the copy was made on another card's scope
+    }
+    check(read_after_drain && stage1_read,
+          "stage 1's state was read on its own device after that device was drained");
+    reset_counters();
+    for (auto* p : {&first,&second,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0x5a);
+    std::fill(gdn0.begin(),gdn0.end(),0x5a); std::fill(hist0.begin(),hist0.end(),0x5a);
+    std::fill(gdn1.begin(),gdn1.end(),0x5a); std::fill(hist1.begin(),hist1.end(),0x5a);
+    stage0.ple_prev[0] = stage0.ple_prev[1] = stage1.ple_prev[0] = stage1.ple_prev[1] = -1;
+    check(conversation_live_restore(image, set, g, error), "both stages' live state restores through the host backend");
+    check(gdn0 == image.live.gdn && hist0 == image.live.ple, "stage 0's running state landed in its own buffers");
+    check(gdn1 == image.stage_images[0].live.gdn && hist1 == image.stage_images[0].live.ple,
+          "stage 1's running state landed in its own buffers");
+    check(first.data[5] == image.live.tails && first.data[6] == image.live.dead &&
+          first.data[7] == image.live.block_pos, "stage 0's indexer payload landed");
+    check(second.data[5] == image.stage_images[0].live.tails &&
+          second.data[6] == image.stage_images[0].live.dead &&
+          second.data[7] == image.stage_images[0].live.block_pos, "stage 1's indexer payload landed");
+    check(stage0.ple_prev[0] == 8 && stage0.ple_prev[1] == 9 &&
+          stage1.ple_prev[0] == 8 && stage1.ple_prev[1] == 9, "both stages got the PLE window");
+    bool stage1_written = false, write_after_drain = true;
+    for (const CopyEvent& e : copy_order) {
+        if (e.drains < 1) write_after_drain = false;
+        if (!on_stage1(e.dst)) continue;
+        stage1_written = true;
+        if (e.device != 1) write_after_drain = false;
+    }
+    check(write_after_drain && stage1_written,
+          "stage 1's buffers were written on its own device after that device was drained");
+    reset_counters();
+    auto bad = image; bad.stage_images.pop_back();
+    check(!conversation_live_restore(bad, set, g, error) && copy_calls == 0,
+          "a park missing a stage part is refused before any transfer");
+#endif
+}
 }
 
 int main() {

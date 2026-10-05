@@ -533,7 +533,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
       target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
       target_link_options(conversation_transfer_test PRIVATE
-        -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
+        -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError
+        -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice)
       target_link_libraries(conversation_transfer_test PRIVATE strata_engine)
       add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
       set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
