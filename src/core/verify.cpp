@@ -689,7 +689,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
+<<<<<<< HEAD
     // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
+=======
+    // Programmatic dependent launch (pdl.hpp; sm_90+, STRATA_DF_PDL=0: off): the window's quantizations and dense
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
     // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
     // the same as without them.
@@ -698,6 +702,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         explicit PdlScope(bool on) : prev(pdl_scope()) { pdl_scope() = on; }
         ~PdlScope() { pdl_scope() = prev; }
     } pdl_window(G == 1 && pdl_supported());
+<<<<<<< HEAD
     // STRATA_DF_BRANCH: mixer work that reads only the layer's input runs on a side stream inside the graph.  fork(i)
     // makes side i depend on everything captured on `cs` so far, join(i) makes `cs` depend on everything captured on
     // side i: a branch never races with what came before its fork or after its join.  Not in a split or batch window,
@@ -711,6 +716,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         cudaEventRecord(df_join_[i], df_side_[i]);
         cudaStreamWaitEvent(cs, df_join_[i], 0);
     };
+=======
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
@@ -1144,6 +1151,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 }
                 stamp(l, 9, grp);
+<<<<<<< HEAD
                 if (qbr) {
                     join(1);   // the indexer query, for the block scores
                 } else {
@@ -1155,6 +1163,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                  rope_scaling(), pos_ + tb * NH, cs);
                     } else {
                     // the q/gate split as a copy kernel: the window's chain stays kernel to kernel (PDL)
+=======
+                native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD),
+                            n, cs);
+                if (qb) {   // the q/gate split as a copy kernel: the window's chain stays kernel to kernel
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
                     copy_rows_strided(qcur_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, (int64_t) n * NH, HD, 2 * HD, cs);
                     norm_rope(qcur_ + tb * NH * HD, wqn, (int) (n * NH), (int) HD, pos_ + tb * NH);
                     }

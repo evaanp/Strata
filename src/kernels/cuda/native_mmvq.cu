@@ -27,10 +27,13 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+<<<<<<< HEAD
 #include "s26_tsum.cuh"
 #if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
 #endif
+=======
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -1164,8 +1167,12 @@ template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = f
 __launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
 __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w,
                                          const Q81Block* STRATA_PDL_RESTRICT x,
+<<<<<<< HEAD
                                          float* STRATA_PDL_RESTRICT y, int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
+=======
+                                         float* STRATA_PDL_RESTRICT y, int n_in, int n_out) {
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     int bxi = int(blockIdx.x);
@@ -1263,6 +1270,7 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
+<<<<<<< HEAD
         launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2, false, false>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out,
                    (const typename F::Block*) nullptr, (float*) nullptr);
         return;
@@ -1281,6 +1289,19 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         return;
+=======
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2>, dim3(blocks), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out);
+        return;
+    }
+    const dim3 threads(WARP, WARPS);
+    if (n_in / F::DIV < F::BPI) {
+        constexpr int ROWS = 2;
+        const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out);
+    } else {
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in,
+                   n_out);
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
     }
     constexpr int ROWS = 2;
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);

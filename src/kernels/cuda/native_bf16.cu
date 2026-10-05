@@ -74,7 +74,11 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 // the same kernel for up to 8 activation rows - the weight row is read ONCE and every
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
+<<<<<<< HEAD
 template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
+=======
+template <int BLOCK_SIZE, int NT>
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
 __global__ void bf16_f32_mmvf_multi_kernel(const float* STRATA_PDL_RESTRICT x, int64_t ldx, const uint16_t* __restrict__ w,
                                           float* STRATA_PDL_RESTRICT y, int64_t ldy, int n_in, int n_tok) {
     const int t = threadIdx.x;
@@ -95,12 +99,20 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* STRATA_PDL_RESTRICT x, i
 #pragma unroll
     for (int q = 0; q < PRE; ++q) {
         const int pair = t + q * BLOCK_SIZE;
+<<<<<<< HEAD
         wpre[q] = pair < n_in / 2 ? __ldg(weights2 + pair) : 0u;
+=======
+        wpre[q] = pair < n_in / 2 ? weights2[pair] : 0u;
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
     }
     pdl_wait();
     int q = 0;
     for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE, ++q) {
+<<<<<<< HEAD
         const uint32_t weight = q < PRE ? wpre[q] : __ldg(weights2 + pair);
+=======
+        const uint32_t weight = q < PRE ? wpre[q] : weights2[pair];
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
         const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
 #pragma unroll
         for (int k = 0; k < NT; ++k) {
@@ -316,6 +328,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         return;
     }
 #define STRATA_MMVF_M(N) case N: \
+<<<<<<< HEAD
     switch (n_tok) { \
         case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
         case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
@@ -325,6 +338,10 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
         default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break; \
     } break
+=======
+    if (n_tok <= 4) launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); \
+    else launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok); break
+>>>>>>> 18683c2 (Verify window: programmatic dependent launch on sm_90+ (STRATA_DF_PDL))
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
         STRATA_MMVF_M(160); STRATA_MMVF_M(192); STRATA_MMVF_M(224); STRATA_MMVF_M(256);
