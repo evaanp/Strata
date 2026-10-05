@@ -1,4 +1,5 @@
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/on_device.hpp"
 #include "conversation_checked.hpp"
 
 #include <algorithm>
@@ -354,6 +355,46 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
+}
+
+std::vector<ConversationKvEntry> conversation_kv_entries(const ConversationStageSet& set) {
+    std::vector<ConversationKvEntry> entries;
+    if (set.stages.empty()) return entries;
+    for (const auto& st : set.stages)
+        for (size_t j = 0; j < owned_qsa(*st.first); ++j) entries.push_back({&owned(*st.first, j), st.second, true});
+    if (set.draft) entries.push_back({set.draft, set.stages.back().second, false});   // the drafter lives on the last stage
+    return entries;
+}
+
+bool conversation_live_save(SavedConversation& image, const ConversationView& view, const ConversationStageSet& set,
+                            const ModelGeometry& g, std::string& error) {
+    if (set.stages.empty() || !set.draft) return fail(error, "a parked conversation needs a session and a drafter");
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = set.stages[0].first->layer_lo; captured.layer_hi = set.stages[0].first->layer_hi;
+    captured.live.ids = view.ids; captured.live.imgs = view.images; captured.cvec = view.cvec;
+    captured.checkpoints = view.checkpoints;
+    for (size_t i = 0; i < set.stages.size(); ++i) {   // each stage drained on its own device first, as in the save
+        const OnDevice on(set.stages[i].second);
+        if (!sync(error)) return false;
+        ConversationCheckpoint& part = i == 0 ? captured.live : captured.stage_images.emplace_back().live;
+        if (i != 0) { part.ids = view.ids; part.imgs = view.images; }
+        if (!conversation_checkpoint_save(part, *set.stages[i].first, g, error)) return false;
+    }
+    image = std::move(captured);
+    return true;
+}
+
+bool conversation_live_restore(const SavedConversation& image, const ConversationStageSet& set,
+                               const ModelGeometry& g, std::string& error) {
+    if (image.stage_images.size() + 1 != set.stages.size()) return fail(error, "a stage's live state is missing");
+    for (size_t i = 0; i < set.stages.size(); ++i) {
+        const OnDevice on(set.stages[i].second);
+        if (!sync(error)) return false;
+        const ConversationCheckpoint& live = i == 0 ? image.live : image.stage_images[i - 1].live;
+        if (!conversation_checkpoint_restore(live, *set.stages[i].first, g, error)) return false;
+    }
+    return true;
 }
 
 // the draft layer's K/V included (the stage that owns the draft head, or no layer split)

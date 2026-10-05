@@ -941,6 +941,7 @@ class StrataEngine:
                 v = tune.get(k)
                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
                     keys += f" {k}={float(v)!r}"
+<<<<<<< HEAD
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
@@ -953,6 +954,19 @@ class StrataEngine:
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
         return keys + StrataEngine.projection_key(sampling)
+=======
+        return keys + StrataEngine.projection_key(sampling) + StrataEngine.conversation_key(sampling)
+
+    CONVERSATION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+    @staticmethod
+    def conversation_key(sampling: dict) -> str:
+        """`conv=ID`: the client's conversation id (header X-Strata-Conversation or body field strata_conversation).
+        An engine started with --conversation-disk-dir parks only conversations that carry one; an id that is not a
+        plain token is dropped rather than passed on (the GEN line is space-separated)."""
+        cid = sampling.get("strata_conversation")
+        return f" conv={cid}" if isinstance(cid, str) and StrataEngine.CONVERSATION_ID.fullmatch(cid) else ""
+>>>>>>> f504c2c (merge prefix-park-analysis onto v0.1.39: keep the hybrid keyless parking, disk parking, split checkpoints and placement scoring; drop what #559/#639/#650 now cover)
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -4514,6 +4528,9 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    cid = self.headers.get("X-Strata-Conversation")
+                    if cid:
+                        req["strata_conversation"] = cid.strip()
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)

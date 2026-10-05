@@ -1,0 +1,44 @@
+    # + conversation parking with --layer-split (branch parking-split, written by Qwen3.8-Flash-Next via OMP,
+    # reviewed; A/B/A bit-identical on the box 2026-10-02). strata:0.1.34-pla2 is the build without it.
+    # + DISK parking (branch disk-parking on evaanp/strata-pla, /root/apps/strata-disk holds the overlay Dockerfile):
+    # conversations with an X-Strata-Conversation header (PLA: <conv>.main / <conv>.agent-<run>) park on disk in
+    # /data/conversations instead of RAM; config strata-iq2_xs.disk.json (--conversation-disk-dir, 32 GiB budget).
+    # disk2 also fixes split mid-prompt checkpoints that lacked their layer carve (every park past 16K was refused).
+    # Revert: docker-compose.yml.pre-disk (strata:0.1.34-parking + RAM parking config).
+    image: strata:0.1.38-pla1-prefix
+    container_name: strata
+    restart: unless-stopped
+    gpus: all
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    ports:
+      - "8080:8080"
+    volumes:
+      # packs, MTP, config, and the GGUF shards on the Samsung NVMe (/models): the config reads them from
+      # /data/models; the copies on the LXC rootfs (/root/strata-models) are the slower Intel disk
+      - /models/strata-data:/data
+      - /models/strata-data/config/strata-iq3_s.arena-0138-prefix.json:/opt/strata/strata-iq2_xs.json  # rw: 0.1.34 setup touches it to mark the last used model
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      # more parallel host copies of mmap'd experts into the pinned ring: +4% (also 0.1.32+'s default for
+      # GGUF-in-place; explicit so a different engine version cannot silently change it)
+      STRATA_STAGER_THREADS: "32"
+      STRATA_STAGER_RING: "128"
+    shm_size: "2gb"
+
+  # Pins the page cache of experts in RAM (expert_lock.py). Pages are shared per file, so the engine's own
+  # mmap of the same GGUF finds them resident on every chunk. --skip must start just past what the GPUs cache
+  # ("token graph hit path: N resident experts" in the engine log); the budget covers the rest plus as many as
+  # possible of the ~6200 experts a prompt borrows out of the GPU caches for its buffers.
+  # Current layout (2026-10-02 evening, 150K context, vision on CUDA0, disk parking): the GPUs hold 17062; rank
+  # 15116..end is only 12.74 GiB (so --gib above that from 15116 locks nothing more). Now --skip 14370 --gib 14 =
+  # 13.75 GiB (10206 experts); MemAvailable ~6 GB idle, min 4.9 GB under real use (cold 52K prefill + parking).
+  # Measured on 73K prefill at 131K context without vision: lock 13 (24 GiB LXC) 83 s, lock 16 (28 GiB) 58.5 s.
+  # !! RAM is the limit: 15 GiB on a 24 GiB LXC froze it (ssh dead; a guard inside the LXC starves with it), and
+  # 16 GiB with vision + 262K left 2.6 GB. Keep MemAvailable >= ~4 GB idle; back at a 24 GiB LXC, lower --gib FIRST.
+  expert-lock:
+    # off since disk5: the engine locks its own complement (--lock-experts-gib); start with --profile legacy-lock
+    profiles: ["legacy-lock"]

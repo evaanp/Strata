@@ -5,7 +5,10 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 
+#include <array>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::core {
 
@@ -43,6 +46,24 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+
+// What a save of one layer up to `upto` produces: its K/V geometry and the byte size of each of the five buffers
+// (K, V, K scales, V scales, pooled indexer rows). A disk image is checked against it before anything is written.
+struct ConversationKvExtent {
+    int format = 0;
+    int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+    std::array<uint64_t, 5> sizes{};
+    bool operator==(const ConversationKvExtent&) const = default;
+};
+bool conversation_kv_extent(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                            ConversationKvExtent& extent, std::string& error);
+// The leading bytes of each buffer a save with `unchanged_tokens` keeps instead of copying (conversation_kv_save's rule).
+std::array<uint64_t, 5> conversation_kv_kept(const ConversationKvExtent& extent, const ModelGeometry& g,
+                                             int64_t unchanged_tokens, bool include_index);
+// The five authoritative buffers in extent order: the host pool for streamed and ring layers, VRAM otherwise.
+std::array<void*, 5> conversation_kv_buffers(const QsaState& state);
+// After the authoritative buffers were written: refill the VRAM slots or the draft ring from them.
+bool conversation_kv_restored(const QsaState& state, const ModelGeometry& g, int64_t upto, std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
@@ -89,6 +110,26 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The sessions a parked conversation is captured from or restored into: the first stage's session (device -1: the
+// caller's current device is that session's), then each later layer-split stage's with the GPU it runs on, in
+// stage order.  `draft` is the drafter, which lives on the last stage's device.
+struct ConversationStageSet {
+    std::vector<std::pair<SessionState*, int>> stages;
+    QsaState* draft = nullptr;
+};
+// The K/V entries in a snapshot's flat order (each stage's owned layers, then the drafter), with their device.
+struct ConversationKvEntry {
+    const QsaState* state;
+    int dev;
+    bool index;   // the drafter's attention has no indexer
+};
+std::vector<ConversationKvEntry> conversation_kv_entries(const ConversationStageSet& set);
+// The live running state of every stage (image.live, one SavedConversation per later stage) without K/V or
+// checkpoints: what disk parking rewrites on every park.
+bool conversation_live_save(SavedConversation& image, const ConversationView& view, const ConversationStageSet& set,
+                            const ModelGeometry& g, std::string& error);
+bool conversation_live_restore(const SavedConversation& image, const ConversationStageSet& set,
+                               const ModelGeometry& g, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
