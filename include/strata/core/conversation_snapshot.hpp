@@ -102,12 +102,23 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+<<<<<<< HEAD
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+=======
+// A prefix entry: one checkpoint plus the K/V up to it, with no live tail and no chain (the keyless
+// park in --serve). The payload comes from `root`, never from a capture of the session: the running
+// state describes everything to the session's live end and cannot be rewound, so capturing it under
+// the root's ids would park the live end's state labelled as the root's - sizes validate, meaning does not.
+bool conversation_prefix_save(SavedConversation& image, const ConversationCheckpoint& root,
+                              const SessionState& session, const ModelGeometry& g,
+                              const QsaState* draft, bool cvec, std::string& error,
+                              ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+>>>>>>> d89dffd (conversation_prefix_save (9825b49): one checkpoint plus the K/V up to it, no live tail - per-session form for 0.1.39's split images: the caller validates each stage's root part against that stage and drains its device; prefix_save never captures the session's running state)
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 // The sessions a parked conversation is captured from or restored into: the first stage's session (device -1: the

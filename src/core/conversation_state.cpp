@@ -326,6 +326,41 @@ bool conversation_session_read_limits(SessionReadLimits& limits, const SessionSt
     return true;
 }
 
+bool conversation_prefix_save(SavedConversation& image, const ConversationCheckpoint& root,
+                              const SessionState& ss, const ModelGeometry& g,
+                              const QsaState* draft, bool cvec, std::string& error,
+                              ConversationKvReuse reuse, size_t* reused_bytes) {
+    if (!root.stage_parts.empty()) return fail(error, "a prefix root must be one stage's part");
+    const std::vector<ConversationCheckpoint> no_chain;
+    const ConversationView view{root.ids, root.imgs, no_chain, cvec};
+    // The checkpoint-less view makes the estimate exact: live payload sizes come from the session's carve,
+    // not the id count, and an empty chain adds no payload.
+    size_t estimate = 0;
+    if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    // Build into a new object so a failure cannot publish a partial snapshot.
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.cvec = cvec;
+    // The entry's live part IS the checkpoint: validate it against this session and move it in as-is.
+    if (!conversation_checkpoint_validate(root, ss, g, error)) return false;
+    captured.live = root;
+    const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
+    captured.kv = std::move(reuse.kv);
+    const size_t layers = owned_qsa(ss);
+    captured.kv.resize(layers + (draft ? 1 : 0));
+    const int64_t upto = (int64_t) root.ids.size();
+    // Only positional state is read here - no running-state copy. The caller drains the session's device first.
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
+                                  unchanged, reused_bytes)) return false;
+    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    captured.prefix = true;
+    image = std::move(captured);
+    return true;
+}
+
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!image.live.stage_parts.empty())
