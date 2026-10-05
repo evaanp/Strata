@@ -6,7 +6,8 @@
 //   kv-E-B.bin  K/V buffer B of entry E (conversation_kv_entries' order). A later park of a conversation that was
 //               restored from these files rewrites only what changed since: the pages from the first rewritten
 //               token on (conversation_kv_kept), plus the small running state;
-//   live.bin    the live running state, one part per stage, rewritten on every park;
+//   live.bin    a format word, then the live running state, one record per stage (stage 0 first, later stages in
+//               stage order), rewritten on every park; the word makes load refuse an entry of another layout;
 //   ck-N.bin    the prompt checkpoint at N tokens, written once: its tokens are a prefix of the live ones, so it
 //               cannot change while the K/V before N is unchanged.
 // The index (token ids, extents, sizes) stays in RAM and the directory is wiped at startup: an image only ever

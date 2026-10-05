@@ -3,6 +3,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/qsa.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -415,11 +416,26 @@ void split_fixture(int format) {
         for (size_t b = 0; b < ext.sizes.size(); ++b) {
             if (ext.sizes[b] > want[b].size()) { all_back = false; break; }
             const auto* got = (const uint8_t*) buffers[b];
-            all_back = all_back && std::equal(want[b].begin(), want[b].begin() + ext.sizes[b], got);
+            // live_restore re-folds the spare pooled row (the partial block's) from the live dead payload, as
+            // conversation_checkpoint_restore does; every other byte of the extent must come back unchanged.
+            const size_t rows_before_fold = (size_t) ids9.size() / strata::kernels::qsa_real_shapes().idx_block;
+            const size_t same = b == 4 && entries[k].index
+                                    ? rows_before_fold * (size_t) g.idx_key_dim * sizeof(float)
+                                    : (size_t) ext.sizes[b];
+            all_back = all_back && std::equal(want[b].begin(), want[b].begin() + (long) same, got);
             extent_bytes += ext.sizes[b];
         }
     }
     check(all_back, "every stage's K/V came back byte for byte over its whole extent");
+    const size_t fold = ((size_t) ids9.size() / strata::kernels::qsa_real_shapes().idx_block)
+                        * (size_t) g.idx_key_dim * sizeof(float);
+    check(parked_ref.live.dead.size() == (size_t) g.idx_key_dim * sizeof(float) &&
+          std::equal(parked_ref.live.dead.begin(), parked_ref.live.dead.end(), first.data[4].begin() + (long) fold),
+          "stage 0's spare pooled block comes back from its parked dead keys");
+    check(parked_ref.stage_images[0].live.dead.size() == (size_t) g.idx_key_dim * sizeof(float) &&
+          std::equal(parked_ref.stage_images[0].live.dead.begin(), parked_ref.stage_images[0].live.dead.end(),
+                     second.data[4].begin() + (long) fold),
+          "stage 1's spare pooled block comes back from its parked dead keys");
     check(moved == extent_bytes, "the restore moved every entry's full extent");
     ConversationDisk::Stats again;
     check(disk.park("c1", view, set, g, (int64_t) ids9.size(), again, error),

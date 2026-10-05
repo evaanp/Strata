@@ -143,6 +143,32 @@ bool read_checkpoint(const std::string& file, ConversationCheckpoint& c, std::st
     return true;
 }
 
+// live.bin holds a format word and then one running-state record per stage (stage 0 first, each later stage
+// in stage order).  Under a layer split stage 0's record alone cannot rebuild the conversation, so the record
+// count must match the stage set.  The word lets load refuse an entry written by a binary of another layout
+// instead of parsing its bytes as records; the directory wipe at startup already removes those between runs,
+// so this is the second lock.
+constexpr uint64_t kLiveFormat = 0x5354524100000001ull;  // "STRA" layout 1
+
+bool read_live(const std::string& file, size_t stages, std::vector<ConversationCheckpoint>& parts,
+               std::string& error) {
+    std::vector<uint8_t> bytes;
+    if (!read_file(file, bytes, error)) return false;
+    Reader r{bytes};
+    uint64_t format = 0;
+    if (!r.u64(format) || format != kLiveFormat)
+        return fail(error, "running state in " + file + " was written by an older strata (format " +
+                               std::to_string(format) + ")");
+    parts.clear();
+    while (r.at < bytes.size()) {
+        parts.emplace_back();
+        if (!r.checkpoint(parts.back()) || !parts.back().stage_parts.empty())
+            return fail(error, "malformed running state in " + file);
+    }
+    if (parts.size() != stages) return fail(error, "the running state does not match the stage set");
+    return true;
+}
+
 std::string kv_file(const std::string& dir, size_t entry, size_t buffer) {
     return dir + "/kv-" + std::to_string(entry) + "-" + std::to_string(buffer) + ".bin";
 }
@@ -268,7 +294,9 @@ bool ConversationDisk::park(const std::string& id, const ConversationView& view,
     }
 
     Writer w;
-    w.checkpoint(live.live);
+    w.u64(kLiveFormat);
+    w.checkpoint(live.live);  // stage 0's running state, then one record per later stage - a park that wrote
+    for (const auto& stage : live.stage_images) w.checkpoint(stage.live);  // only stage 0 could never be loaded
     if (!write_file(dir + "/live.bin", w.out, error)) return failed();
     stats.written += w.out.size();
     next.bytes += w.out.size();
@@ -309,12 +337,16 @@ bool ConversationDisk::load(const std::string& id, const ConversationStageSet& s
     const std::string dir = path(id);
     SavedConversation loaded;
     loaded.geometry = e.geometry; loaded.layer_lo = e.layer_lo; loaded.layer_hi = e.layer_hi; loaded.cvec = e.cvec;
-    if (!read_checkpoint(dir + "/live.bin", loaded.live, error)) return false;
+    std::vector<ConversationCheckpoint> lives;
+    if (!read_live(dir + "/live.bin", set.stages.size(), lives, error)) return false;
+    loaded.live = std::move(lives[0]);
+    for (size_t i = 1; i < lives.size(); ++i) {
+        loaded.stage_images.emplace_back();
+        loaded.stage_images.back().live = std::move(lives[i]);
+    }
     if (loaded.live.ids != e.ids || loaded.live.imgs != e.imgs) return fail(error, "live tokens differ from the index");
     for (int64_t n : e.checkpoints)
         if (!read_checkpoint(ck_file(dir, n), loaded.checkpoints.emplace_back(), error)) return false;
-    if (!loaded.live.stage_parts.empty() || loaded.stage_images.size() + 1 != set.stages.size())
-        return fail(error, "the running state does not match the stage set");
     for (size_t i = 0; i < loaded.stage_images.size(); ++i)
         if (loaded.stage_images[i].live.ids != e.ids || loaded.stage_images[i].live.imgs != e.imgs)
             return fail(error, "a stage's live tokens differ from the index");
