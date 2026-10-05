@@ -4319,7 +4319,123 @@ class ConnectionClose(unittest.TestCase):
 
     def test_a_streamed_answer_says_the_connection_closes(self):
         self.assertEqual(self.headers(stream=True).get("Connection"), "close")
+class MergingTokenizer(ByteTokenizer):
+    """The byte tokenizer plus one merged token, "ab" = 300: enough to sample a split it would never produce."""
+    AB = 300
 
+    def encode(self, text, parse_special=False):
+        out = []
+        for t in super().encode(text, parse_special):
+            if out and out[-1] == ord("a") and t == ord("b"):
+                out[-1] = self.AB
+            else:
+                out.append(t)
+        return out
+
+    def token_bytes(self, t):
+        if t == self.AB:
+            return b"ab"
+        return self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
+
+    def decode(self, ids, errors="replace"):
+        return b"".join(self.token_bytes(t) for t in ids).decode("utf-8", errors=errors)
+
+
+class SampledIds(unittest.TestCase):
+    """A split the model sampled ("a", "b") comes back as the tokenizer's merge ("ab"): the next prompt must carry
+    the sampled ids, or it stops continuing the engine's live end (a re-read of thousands of tokens on strata)."""
+
+    def setUp(self):
+        self.tok = MergingTokenizer()
+        sampled = self.tok.encode("\n</think>\n\n", parse_special=True) + [ord("a"), ord("b")] + \
+            self.tok.encode("<|im_end|>", parse_special=True)
+        self.engine = MockEngine(self.tok, "unused", max_context=CTX)
+        self.engine.scripts = [sampled]
+        self.engine.script = sampled
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body, conversation="c1"):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "X-Strata-Conversation": conversation})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def two_turns(self, second_conversation="c1", answer="ab"):
+        first = [{"role": "user", "content": "hi"}]
+        self.post("/v1/chat/completions", {"model": "m", "messages": first, "max_tokens": 50})
+        live = self.engine.last_prompt + self.engine.script
+        second = first + [{"role": "assistant", "content": answer}, {"role": "user", "content": "more"}]
+        self.post("/v1/chat/completions", {"model": "m", "messages": second, "max_tokens": 50}, second_conversation)
+        return live, self.engine.last_prompt
+
+    def test_the_next_prompt_carries_the_sampled_ids(self):
+        live, prompt = self.two_turns()
+        self.assertEqual(prompt[:len(live)], live)
+
+    def test_another_conversation_keeps_the_tokenizers_ids(self):
+        live, prompt = self.two_turns(second_conversation="c2")
+        self.assertNotEqual(prompt[:len(live)], live)
+        self.assertIn(MergingTokenizer.AB, prompt)
+
+    def test_different_text_is_not_spliced(self):
+        live, prompt = self.two_turns(answer="ac")
+        rendered = self.tok.encode(self.svc.template.render(
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ac"},
+             {"role": "user", "content": "more"}]), parse_special=True)
+        self.assertEqual(prompt, rendered)
+
+
+class TokenizerRoutes(unittest.TestCase):
+    """llama-server's /tokenize, /detokenize and /apply-template: the prompt and ids this server reads."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = MergingTokenizer()
+        cls.svc = Service(MockEngine(cls.tok, "ok", max_context=CTX), cls.tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_tokenize_uses_the_servers_tokenizer(self):
+        self.assertEqual(self.post("/tokenize", {"content": "xab<|im_end|>"}),
+                         (200, {"tokens": [ord("x"), MergingTokenizer.AB, 257]}))
+
+    def test_tokenize_with_pieces(self):
+        self.assertEqual(self.post("/tokenize", {"content": "ab", "with_pieces": True}),
+                         (200, {"tokens": [{"id": MergingTokenizer.AB, "piece": "ab"}]}))
+
+    def test_detokenize_round_trips(self):
+        self.assertEqual(self.post("/detokenize", {"tokens": [ord("x"), MergingTokenizer.AB]}), (200, {"content": "xab"}))
+
+    def test_detokenize_rejects_non_ids(self):
+        self.assertEqual(self.post("/detokenize", {"tokens": ["a"]})[0], 400)
+
+    def test_apply_template_is_the_prompt_chat_completions_reads(self):
+        messages = [{"role": "user", "content": "hi"}]
+        status, body = self.post("/apply-template", {"messages": messages})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["prompt"], self.svc.template.render(messages))
 
 class AnswerBeforeTheBody(unittest.TestCase):
     """An answer sent before the request body was read must still reach a client that sends the body after the headers

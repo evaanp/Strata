@@ -2249,6 +2249,73 @@ class ByteTokenizer:
         return raw.decode("utf-8", errors=errors)
 
 
+class SampledTails:
+    """The ids the engine holds for each conversation (its prompt plus what it sampled), so a client that sends the
+    same text back gets the same ids back.
+
+    A model can sample a split the tokenizer would never produce (a rare character as two tokens where the
+    vocabulary has one).  The client renders that text again, the tokenizer merges it, and from that token on the
+    prompt no longer continues the engine's live end: the engine falls back to its last checkpoint and reads
+    thousands of tokens again (6834 after a 16K-character tool call, 2026-10-02).  `splice` puts the sampled ids
+    back wherever the bytes are the same.  Only with a tokenizer that has `token_bytes`: comparing decoded text
+    would call two different halves of a character equal (both decode to U+FFFD)."""
+
+    def __init__(self, keep: int = 32):
+        self.keep, self.held = keep, collections.OrderedDict()
+
+    def record(self, conversation: str, ids: list[int]):
+        self.held[conversation] = list(ids)
+        self.held.move_to_end(conversation)
+        while len(self.held) > self.keep:
+            self.held.popitem(last=False)
+
+    def splice(self, conversation: str, ids: list[int], tok) -> list[int]:
+        held = self.held.get(conversation)
+        token_bytes = getattr(tok, "token_bytes", None)
+        if not held or token_bytes is None:
+            return ids
+        d = 0
+        for a, b in zip(held, ids):
+            if a != b:
+                break
+            d += 1
+        if d == len(held) or d == len(ids):
+            return ids
+        # walk both from the first different id; (j, k) is the last point where both sides have produced the same
+        # bytes and end on a token boundary
+        i, k, best = d, d, None
+        mine, theirs = b"", b""
+        while True:
+            if len(mine) == len(theirs):
+                if mine != theirs:
+                    break
+                if i > d:
+                    best = (i, k)
+                mine = theirs = b""
+                if i == len(held) or k == len(ids):
+                    break
+                mine, theirs = token_bytes(held[i]), token_bytes(ids[k])
+                i, k = i + 1, k + 1
+            elif len(mine) < len(theirs):
+                if i == len(held) or not theirs.startswith(mine):
+                    break
+                mine += token_bytes(held[i])
+                i += 1
+            else:
+                if k == len(ids) or not mine.startswith(theirs):
+                    break
+                theirs += token_bytes(ids[k])
+                k += 1
+        if best is None:
+            return ids
+        j, k = best
+        window = lambda xs, at: ",".join(str(x) for x in xs[max(0, at - 4):at]) + "|" + \
+            ",".join(str(x) for x in xs[at:at + 8])
+        print(f"[strata] conversation {conversation or '-'}: kept {j - d} sampled ids for {k - d} the prompt had at "
+              f"{d} of {len(ids)}; sampled={window(held, d)} prompt={window(ids, d)}", flush=True)
+        return ids[:d] + held[d:j] + ids[k:]
+
+
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
@@ -2414,6 +2481,7 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.tails = SampledTails()                     # the sampled ids per conversation (see SampledTails)
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -3273,8 +3341,9 @@ class Service:
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
-                    prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
-                    for ev in opening:
+                    conversation = str((sampling or {}).get("strata_conversation") or "")
+                    prompt, thought = self.tails.splice(conversation, ids, self.tok), 0   # thought: the reasoning
+                    for ev in opening:                                                    # tokens so far (the budget's)
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
@@ -3296,6 +3365,7 @@ class Service:
                                 if t in self.stop_ids:
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    seg.append(t)           # sampled like the rest (SampledTails)
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -3451,6 +3521,8 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                    else:                               # a cancelled request leaves the engine without a live end
+                        self.tails.record(conversation, prompt + seg)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -4452,6 +4524,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path in ("/tokenize", "/detokenize", "/apply-template"):
+                    self._tokenizer_route(path, req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -4914,6 +4988,30 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _tokenizer_route(self, path, req):
+            """llama-server's /tokenize, /detokenize and /apply-template, so a client can see the ids and the prompt
+            this server reads without running the model (the tokenizer and template live here, not in the engine)."""
+            if path == "/tokenize":
+                content = req.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("'content' must be a string")
+                ids = svc.tok.encode(content, parse_special=req.get("parse_special", True) is not False)
+                if req.get("with_pieces"):
+                    self._json(200, {"tokens": [{"id": t, "piece": svc.tok.decode([t])} for t in ids]})
+                else:
+                    self._json(200, {"tokens": ids})
+            elif path == "/detokenize":
+                ids = req.get("tokens")
+                if not isinstance(ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) for t in ids):
+                    raise ValueError("'tokens' must be a list of token ids")
+                try:
+                    self._json(200, {"content": svc.tok.decode(ids)})
+                except (IndexError, KeyError) as e:
+                    raise ValueError(str(e)) from None
+            else:
+                messages, tools, kw = openai_to_messages(svc.with_shared(req, "openai"))
+                self._json(200, {"prompt": svc.template.render(messages, tools=tools, **kw)})
 
         def _anthropic(self, req):
             svc.load()
