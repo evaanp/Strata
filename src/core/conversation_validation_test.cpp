@@ -1,10 +1,13 @@
 // Host-only validation fixtures. CUDA is linked but must never be initialized:
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/conversation_disk.hpp"
 #include "strata/kernels/kv_q4.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <cstring>
@@ -27,6 +30,12 @@ extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }
 extern "C" cudaError_t __wrap_cudaGetLastError() { return cudaSuccess; }
+// The disk park's bounce buffer and staging come from pinned host memory; here they are plain malloc.
+extern "C" cudaError_t __wrap_cudaHostAlloc(void** p, size_t n, unsigned) {
+    *p = std::malloc(n);
+    return *p ? cudaSuccess : cudaErrorMemoryAllocation;
+}
+extern "C" cudaError_t __wrap_cudaFreeHost(void* p) { std::free(p); return cudaSuccess; }
 #endif
 
 using namespace strata::core;
@@ -267,6 +276,14 @@ void split_fixture(int format) {
     ConversationCheckpoint cp5;   // a retained checkpoint at token 5, as the cache would hold it
     cp5.ids.assign(ids9.begin(), ids9.begin() + 5);
     cp5.imgs = {{1, 44}};
+    ConversationCheckpoint part5;   // stage 1's part of that checkpoint: the merged chain shape serve holds
+    part5.ids = cp5.ids; part5.imgs = cp5.imgs;
+    part5.layer_lo = 4; part5.layer_hi = 8;
+    ConversationStateSizes z1;
+    check(conversation_session_sizes(g, stage1, z1, error), "stage 1 carve sizing");
+    part5.gdn.assign(z1.gdn, 0x2a); part5.ple.assign(z1.ple, 0x2b);
+    part5.tails.assign(z1.tail, 0x2c); part5.dead.assign(z1.dead, 0x2d); part5.block_pos.assign(z1.block_pos, 0x2e);
+    cp5.stage_parts.push_back(std::move(part5));
     const ConversationView view{ids9, {{1, 44}}, {cp5}, true};
     SavedConversation short_image; short_image.stage_images.emplace_back();   // one part for two stages
     check(!conversation_live_restore(short_image, set, g, error), "a park missing a stage's live state is refused");
@@ -329,6 +346,106 @@ void split_fixture(int format) {
     auto bad = image; bad.stage_images.pop_back();
     check(!conversation_live_restore(bad, set, g, error) && copy_calls == 0,
           "a park missing a stage part is refused before any transfer");
+    // ---- disk parking through the same host backend (pla-0139 regression: park wrote only stage 0's live
+    // state into live.bin, so under a split every load failed with "the running state does not match the
+    // stage set" and every returning conversation re-prefilled). Seed every buffer with distinct bytes, park
+    // to a scratch directory, load back, compare, then restore into pools scrubbed to another value: a stage
+    // whose K/V or running state was skipped stays wrong.
+    auto fill = [](std::vector<uint8_t>& v, size_t tag) {
+        for (size_t i = 0; i < v.size(); ++i) v[i] = (uint8_t) (i * 29 + tag);
+    };
+    fill(gdn0, 1); fill(hist0, 3); fill(gdn1, 5); fill(hist1, 7);
+    for (size_t b = 0; b < first.data.size(); ++b) {
+        fill(first.data[b], 11 + b); fill(second.data[b], 31 + b); fill(draft.data[b], 51 + b);
+    }
+    const auto want_first = first.data, want_second = second.data, want_draft = draft.data;
+    SavedConversation parked_ref;
+    check(conversation_live_save(parked_ref, view, set, g, error), "live reference for the disk park");
+    namespace fs = std::filesystem;
+    const std::string dir = (fs::temp_directory_path() / ("strata-disk-test-" + std::to_string(format))).string();
+    fs::remove_all(dir);
+    ConversationDisk disk;
+    error.clear();
+    check(disk.open(dir, 1u << 30, error), "disk parking opens its scratch directory");
+    ConversationDisk::Stats stats;
+    check(disk.park("c1", view, set, g, 0, stats, error), "the two-stage conversation parks to disk");
+    check(stats.written > 0, "the park wrote K/V, checkpoints and running state");
+    for (auto* p : {&first,&second,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0x5a);
+    std::fill(gdn0.begin(),gdn0.end(),0x5a); std::fill(hist0.begin(),hist0.end(),0x5a);
+    std::fill(gdn1.begin(),gdn1.end(),0x5a); std::fill(hist1.begin(),hist1.end(),0x5a);
+    SavedConversation loaded;
+    const bool load_ok = disk.load("c1", set, g, loaded, error);
+    if (!load_ok) std::fprintf(stderr, "disk load of the split park failed: %s\n", error.c_str());
+    check(load_ok, "the two-stage park loads back from disk");
+    check(loaded.live.ids == ids9 && loaded.live.imgs == view.images, "the loaded live end matches the parked conversation");
+    if (loaded.stage_images.size() != 1) {
+        check(false, "stage 1's live state comes back from disk too");
+    } else {
+        check(loaded.stage_images[0].live.ids == ids9 && loaded.stage_images[0].live.imgs == view.images,
+              "stage 1's live part carries the same conversation");
+        check(loaded.live.gdn == parked_ref.live.gdn && loaded.live.ple == parked_ref.live.ple &&
+              loaded.live.tails == parked_ref.live.tails && loaded.live.dead == parked_ref.live.dead &&
+              loaded.live.block_pos == parked_ref.live.block_pos, "stage 0's running-state payload round-trips");
+        check(loaded.stage_images[0].live.gdn == parked_ref.stage_images[0].live.gdn &&
+              loaded.stage_images[0].live.ple == parked_ref.stage_images[0].live.ple &&
+              loaded.stage_images[0].live.tails == parked_ref.stage_images[0].live.tails &&
+              loaded.stage_images[0].live.dead == parked_ref.stage_images[0].live.dead &&
+              loaded.stage_images[0].live.block_pos == parked_ref.stage_images[0].live.block_pos,
+              "stage 1's running-state payload round-trips");
+    }
+    check(loaded.checkpoints.size() == 1 && loaded.checkpoints[0].ids == cp5.ids &&
+          loaded.checkpoints[0].imgs == cp5.imgs && loaded.checkpoints[0].stage_parts.size() == 1 &&
+          loaded.checkpoints[0].stage_parts[0].gdn == cp5.stage_parts[0].gdn &&
+          loaded.checkpoints[0].stage_parts[0].tails == cp5.stage_parts[0].tails,
+          "the mid-prompt checkpoint keeps its stage part through the disk round-trip");
+    uint64_t moved = 0;
+    const auto restored = disk.restore("c1", loaded, set, g, moved, error);
+    if (restored != ConversationRestore::restored) std::fprintf(stderr, "disk restore failed: %s\n", error.c_str());
+    check(restored == ConversationRestore::restored, "the split park restores into both stages");
+    size_t extent_bytes = 0;
+    bool all_back = true;
+    for (size_t k = 0; k < entries.size() && all_back; ++k) {
+        ConversationKvExtent ext;
+        if (!conversation_kv_extent(*entries[k].state, g, (int64_t) ids9.size(), entries[k].index, ext, error)) {
+            all_back = false;
+            break;
+        }
+        const auto buffers = conversation_kv_buffers(*entries[k].state);
+        const auto& want = k == 0 ? want_first : (k == 1 ? want_second : want_draft);
+        for (size_t b = 0; b < ext.sizes.size(); ++b) {
+            if (ext.sizes[b] > want[b].size()) { all_back = false; break; }
+            const auto* got = (const uint8_t*) buffers[b];
+            all_back = all_back && std::equal(want[b].begin(), want[b].begin() + ext.sizes[b], got);
+            extent_bytes += ext.sizes[b];
+        }
+    }
+    check(all_back, "every stage's K/V came back byte for byte over its whole extent");
+    check(moved == extent_bytes, "the restore moved every entry's full extent");
+    ConversationDisk::Stats again;
+    check(disk.park("c1", view, set, g, (int64_t) ids9.size(), again, error),
+          "re-parking the restored conversation works");
+    check(again.kept > 0 && again.written < stats.written, "the re-park keeps the K/V and checkpoint it need not rewrite");
+    {
+        fs::path entry;   // the hashed directory name is ConversationDisk's own: it is the only child
+        for (const auto& child : fs::directory_iterator(dir)) entry = child.path();
+        const fs::path live = entry / "live.bin";
+        std::ifstream in(live, std::ios::binary);
+        const std::vector<uint8_t> raw{(std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>()};
+        in.close();
+        check(raw.size() > 8, "the running-state file carries its format word");
+        std::ofstream out(live, std::ios::binary | std::ios::trunc);   // strip the word: what an older binary wrote
+        out.write((const char*) raw.data() + 8, (std::streamsize) (raw.size() - 8));
+        out.close();
+        SavedConversation half;
+        check(!disk.load("c1", set, g, half, error), "an entry from an older binary is refused");
+        check(error.find("older strata") != std::string::npos, "the refusal names the running-state format");
+        check(half.live.ids.empty() && half.stage_images.empty(), "a refused entry is not half-loaded");
+        disk.drop("c1");
+        SavedConversation gone;
+        check(!disk.load("c1", set, g, gone, error) && error.find("no parked") != std::string::npos,
+              "the refused entry is removed");
+    }
+    fs::remove_all(dir);
 #endif
 }
 }
