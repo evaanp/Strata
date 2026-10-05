@@ -21,6 +21,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import collections
 import base64
@@ -2278,7 +2279,7 @@ class SampledTails:
         self.keep, self.held = keep, collections.OrderedDict()
 
     def record(self, conversation: str, ids: list[int]):
-        self.held[conversation] = list(ids)
+        self.held[conversation] = array.array("i", ids)   # 4 bytes a token, not a list's ~36
         self.held.move_to_end(conversation)
         while len(self.held) > self.keep:
             self.held.popitem(last=False)
@@ -2327,7 +2328,7 @@ class SampledTails:
             ",".join(str(x) for x in xs[at:at + 8])
         print(f"[strata] conversation {conversation or '-'}: kept {j - d} sampled ids for {k - d} the prompt had at "
               f"{d} of {len(ids)}; sampled={window(held, d)} prompt={window(ids, d)}", flush=True)
-        return ids[:d] + held[d:j] + ids[k:]
+        return ids[:d] + held[d:j].tolist() + ids[k:]
 
 
 # ------------------------------------------------------------------------------------------------ core
