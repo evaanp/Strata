@@ -2626,7 +2626,8 @@ bool FileExpertSource::pin_cache_complement(
     complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
-    complement_lent_slots_ = (lend ? n_slots - keep_from : 0) + stage_lent;
+    complement_lent_slots_ = lend ? n_slots - keep_from : 0;
+    complement_lent_slots_ += stage_lent;   // and the split stages' regions: pairs the copy kept of them
     complement_ready_ = true;
     std::fprintf(stderr, "FileExpertSource: %s cache complement ready: resident %.2f GiB, pinned %.2f GiB in %.0f s%s%s\n",
                  complement_pinned_ ? "mapped pinned" : pin ? "locked resident" : "pageable resident",
