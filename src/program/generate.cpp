@@ -6353,6 +6353,8 @@ int main(int argc, char** argv) {
         }
         // a layer split: the experts every later stage's cache holds are left out of the RAM copy, as CUDA0's are
         // (with them the copy keeps no lend region: pin_cache_complement turns the loan off)
+        // (true of the single lend region only: the stage_lend_regions block below hands every part's
+        // borrowed tail to the copy as well, so under a split the copy keeps a lend region per part again)
         std::vector<std::pair<int32_t, int32_t>> stage_pairs;
         for (auto& st : stages)
             for (int64_t l = st->lb; l < st->le; ++l)
