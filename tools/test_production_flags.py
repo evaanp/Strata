@@ -42,11 +42,10 @@ PRODUCTION = [
     '--mtp', '/data/packs/mtp-draft.gguf',
     '--mtp-max-t', '4',
     '--spec', '4',
-    '--vision', 'auto',
+    '--vision',
     '--pool-workers', '6',
     '--expert-cache', 'auto',
     '--pipeline-windows', '1',
-    '--expert-cache-gguf', '/data/packs/strata-mm/expert-cache-q4.gguf',
 ]
 
 
