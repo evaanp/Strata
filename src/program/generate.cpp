@@ -699,6 +699,10 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    /// --serve: park conversations with a `conv=` id on disk under this directory (see conversation_disk.hpp); empty
+    /// = off.  Requests without an id still use the RAM cache (--conversation-cache-mib), so the two live side by side.
+    std::string conversation_disk_dir;
+    int64_t conversation_disk_gib = 32;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
     /// --serve: park conversations with a `conv=` id on disk under this directory (see conversation_disk.hpp); empty
@@ -867,8 +871,9 @@ void usage() {
                  "                       without an id use the RAM cache (--conversation-cache-mib) beside it\n"
                  "  --conversation-disk-gib N  --serve: disk budget for parked conversations (default 32)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
-                 "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
-                 "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
+                 "  --prompt-cache-tail  --serve: one extra checkpoint near the prompt's end, at an existing\n"
+                 "                       chunk boundary; a layer split saves it from the stage parts at the same\n"
+                 "                       boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
@@ -3387,6 +3392,7 @@ int main(int argc, char** argv) {
     // the windows and - only on the stage that carries them - the drafter and the head.
     const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
     const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
+
     // --pipeline-windows: a second verifier on every stage (its arena alone is 70-75 MiB and its graphs come on top:
     // 64 MiB left two RTX 5070 Ti under Linux short of it) and, with the decode pipelined, two copies of the first
     // stage's GDN state (sized from its session where the first card's cache is sized; this is the split search's
@@ -3878,6 +3884,9 @@ int main(int argc, char** argv) {
         while (st < (int) split_at.size() && l >= split_at[(size_t) st]) ++st;
         return st;
     };
+    // THE GLOBAL RANK, kept before the split hands CUDA0 its own share.  The spill tiers fill from THIS list:
+    // "hottest" has to mean hottest across the whole model, and by the line below `profile` is CUDA0's slice.
+    const std::vector<std::pair<int32_t, int32_t>> full_profile = profile;
     // the whole ranking, hottest first, before each stage takes its own layers' share: the resident RAM copy ranks
     // the experts no GPU holds over ALL the layers (with CUDA0's share alone, a copy that did not fit kept only layers
     // 0..K-1's experts and read every later layer's from the files)
@@ -7496,6 +7505,46 @@ int main(int argc, char** argv) {
                 return true;
             }
         };
+        // ---- disk parking (--conversation-disk-dir): `live_conv` is the id of the conversation the session holds, and
+        // `disk_unchanged` how many of its leading tokens still have byte-identical K/V in that id's files - set when it
+        // was parked or restored, lowered to where each request starts rewriting the session.  A park then writes only
+        // the K/V past it.
+        strata::core::ConversationDisk disk;
+        if (o.prompt_cache > 0 && !o.conversation_disk_dir.empty()) {
+            if (!disk.open(o.conversation_disk_dir, (uint64_t) o.conversation_disk_gib << 30, err)) {
+                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata serve: conversation disk: parking in %s (budget %lld GiB)\n",
+                         o.conversation_disk_dir.c_str(), (long long) o.conversation_disk_gib);
+        }
+        int64_t disk_unchanged = 0;
+        // the sessions disk parking captures and restores: the main session (the caller's current device is its
+        // stage), then each later split stage on its own GPU, and the drafter, which lives on the last one
+        auto park_set = [&]() {
+            strata::core::ConversationStageSet s;
+            s.stages.push_back({&ss, -1});
+            for (auto& st : stages) s.stages.push_back({&st->ss, st->dev});
+            s.draft = &mtp.kv_state_rw();   // parking restores INTO it; #646 split the accessor
+            return s;
+        };
+        auto park_disk = [&]() {
+            if (!disk.enabled() || live_conv.empty() || !live_ok || live.empty()) return;
+            const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
+            strata::core::ConversationDisk::Stats st;
+            const auto t0 = Clock::now();
+            if (!disk.park(live_conv, view, park_set(), g, disk_unchanged, st, err)) {
+                std::fprintf(stderr, "strata serve: conversation disk: skip parking %s (%s)\n", live_conv.c_str(),
+                             err.c_str());
+                err.clear();   // a miss, not a request error
+                return;
+            }
+            disk_unchanged = (int64_t) live.size();
+            std::fprintf(stderr, "strata serve: conversation disk: parked %s: %zu tokens in %.1f ms, wrote %.1f MiB, "
+                                 "kept %.1f MiB; parked=%zu on_disk=%.1f GiB evicted=%zu\n",
+                         live_conv.c_str(), live.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                         st.written / 1048576.0, st.kept / 1048576.0, disk.size(), st.on_disk / 1073741824.0, st.evicted);
+        };
         int64_t pp_total = 0, pp_from = 0, pp_next_check = 0;
         bool pp_tail_saved = false;
         // #471: the position the prompt pass has read up to (a chunk's or a window's end): what a request cancelled
@@ -7514,6 +7563,7 @@ int main(int argc, char** argv) {
         std::mutex part_mu;
         std::map<int64_t, std::vector<ConvCheckpoint>> part_at;   // position -> one part per stage
         std::vector<int64_t> part_next(stages.size() + 1, INT64_MAX);
+        std::vector<int64_t> part_last(stages.size() + 1, 0);   // last chunk end seen by each stage (its chunk size)
         // a checkpoint of the state after `cur[0, L)`; false only when the copy itself failed.  `parts`: the stages'
         // states saved at L (a split's mid-prompt checkpoint); without, they are read now (everything is at L)
         // #613: why the last checkpoint_at failed - a failed device sync is the GPU itself (a hang Windows then resets),
@@ -7614,7 +7664,7 @@ int main(int argc, char** argv) {
             // Keep the prefill's existing chunk geometry. One extra near-tail checkpoint
             // can serve a branch whose shared prefix ends before the final cached state.
             const bool tail_checkpoint = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
-                !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
+                !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
                 pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
             if (periodic_checkpoint || tail_checkpoint) {
                 bool saved = false;
@@ -7628,7 +7678,7 @@ int main(int argc, char** argv) {
                     }
                     bool complete = parts.size() == stages.size() + 1;
                     for (const ConvCheckpoint& k : parts) complete = complete && !k.gdn.empty();
-                    saved = !complete || checkpoint_at(done, &parts);   // an incomplete set: no checkpoint here
+                    saved = !complete || checkpoint_at(done, &parts, tail_checkpoint && !periodic_checkpoint);
                 } else {
                     saved = checkpoint_at(done, nullptr, tail_checkpoint && !periodic_checkpoint);
                 }
@@ -7645,8 +7695,16 @@ int main(int argc, char** argv) {
                 strata::prefill::Prefill& stage_sp = i == 0 ? sp : stages[i - 1]->sp;
                 strata::core::SessionState& stage_ss = i == 0 ? ss : stages[i - 1]->ss;
                 stage_sp.on_stage_chunk = [&, i](int64_t done, std::string& e) -> bool {
-                    if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0 || done < part_next[i]) return true;
-                    part_next[i] = done + o.prompt_cache_every;
+                    if (o.prompt_cache <= 0 || o.prompt_cache_every <= 0) return true;
+                    // --prompt-cache-tail under a layer split: the near-tail boundary is decided per stage from
+                    // its own chunk geometry, which every stage reads the same way, so they claim the same `done`.
+                    // The assembly in on_chunk still refuses an incomplete part set, so a disagreement (raced
+                    // chunking) simply means no tail checkpoint this request - never a half one.
+                    const bool tail_here = o.prompt_cache_tail && pp_total - done > std::max<int64_t>(1, o.short_read) &&
+                                           pp_total - done <= done - part_last[i];
+                    part_last[i] = done;
+                    if (done >= part_next[i]) part_next[i] = done + o.prompt_cache_every;
+                    else if (!tail_here) return true;
                     ConvCheckpoint part;   // this stage's state at `done` (its stream is synchronized)
                     part.ids.assign(cur.begin(), cur.begin() + done);
                     if (!checkpoint_save(part, stage_ss, g)) { e = "saving a checkpoint part failed"; return false; }
@@ -9302,6 +9360,7 @@ int main(int argc, char** argv) {
                     const std::string key = tok.substr(0, eq);
                     const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
                     if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "conv") req_conv = tok.substr(eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
                     else if (key == "conv") req_conv = tok.substr(eq + 1);
@@ -10308,7 +10367,7 @@ int main(int argc, char** argv) {
                 return e != nullptr && std::atoi(e) != 0;
             }();
             // Only add a snapshot; the existing token and image checks still decide reuse.
-            const int64_t message_at = message_checkpoint && !multi_gpu && o.prompt_cache > 0
+            const int64_t message_at = message_checkpoint && o.prompt_cache > 0
                 ? strata::program::message_checkpoint_boundary(ids, resume, turn_at, o.turn_token) : -1;
             // pin=N (opt-in): one more place the prompt is read to and checkpointed.  One pinned prefix at a time: a
             // new pin replaces the old; it needs room for the root, the pin and a rotating checkpoint
