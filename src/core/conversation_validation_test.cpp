@@ -20,14 +20,28 @@
 namespace {
 int copy_calls = 0, sync_calls = 0, fail_copy = 0, fail_sync = 0;
 size_t copied_bytes = 0;
+int current_device = 0;                        // the device OnDevice has made current
+int drained_on_device[4] = {0};                // drains counted on each device
+struct CopyEvent { int device; int drains; const void* dst; const void* src; };
+std::vector<CopyEvent> copy_order;   // what the wrapping backend saw at each copy
+void reset_counters() {
+    copy_calls = sync_calls = fail_copy = fail_sync = 0;
+    copied_bytes = 0; current_device = 0;
+    for (int& n : drained_on_device) n = 0;
+    copy_order.clear();
 }
+}
+extern "C" cudaError_t __wrap_cudaGetDevice(int* p) { *p = current_device; return cudaSuccess; }
+extern "C" cudaError_t __wrap_cudaSetDevice(int d) { current_device = d; return cudaSuccess; }
 extern "C" cudaError_t __wrap_cudaMemcpy(void* dst, const void* src, size_t n, cudaMemcpyKind) {
     if (++copy_calls == fail_copy) return cudaErrorInvalidValue;
     copied_bytes += n;
+    copy_order.push_back({current_device, drained_on_device[current_device], dst, src});
     std::memcpy(dst, src, n);
     return cudaSuccess;
 }
 extern "C" cudaError_t __wrap_cudaDeviceSynchronize() {
+    ++drained_on_device[current_device];
     return ++sync_calls == fail_sync ? cudaErrorUnknown : cudaSuccess;
 }
 extern "C" cudaError_t __wrap_cudaGetLastError() { return cudaSuccess; }
@@ -106,6 +120,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         c.ids.resize(tokens);
         for (size_t i = 0; i < tokens; ++i) c.ids[i] = (int32_t) i + 1;
         c.imgs = {{1, 44}};
+        c.layer_lo = ss.layer_lo; c.layer_hi = ss.layer_hi;
         c.gdn.resize(z.gdn, 13); c.ple.resize(ple ? z.ple : 0, 13);
         c.tails.resize(g.n_qsa_layers() * z.tail, 13); c.dead.resize(g.n_qsa_layers() * z.dead, 13);
         c.block_pos.resize(g.n_qsa_layers() * z.block_pos, 13);
@@ -160,6 +175,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
               "carved session sizes cover the owned rows only");
         check(!conversation_checkpoint_validate(image.live,stage,g,error), "whole-model checkpoint rejected by a carve");
         ConversationCheckpoint part = image.live;
+        part.layer_lo = stage.layer_lo; part.layer_hi = stage.layer_hi;
         part.gdn.resize(zs.gdn); part.tails.resize(zs.tail); part.dead.resize(zs.dead);
         part.block_pos.resize(zs.block_pos);
         check(conversation_checkpoint_validate(part,stage,g,error), "carve-sized checkpoint validates");
@@ -180,7 +196,7 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         for (auto* p : {&first,&last,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0xa5);
         std::fill(gdn.begin(),gdn.end(),0xa5); std::fill(history.begin(),history.end(),0xa5);
         ss.ple_prev[0] = ss.ple_prev[1] = -1;
-        copy_calls = sync_calls = fail_copy = fail_sync = 0;
+        reset_counters();
     };
     reset(); fail_sync = 1;
     check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::transfer_failed,
@@ -469,5 +485,6 @@ void split_fixture(int format) {
 int main() {
     for (int format : {0,1,2}) for (int experts : {256,512})
         for (bool zero_qsa : {false,true}) for (bool ple : {false,true}) fixture(format,experts,zero_qsa,ple);
+    for (int format : {0,1,2}) split_fixture(format);
     std::printf("conversation_validation_test: %d host-only checks passed\n", checks);
 }

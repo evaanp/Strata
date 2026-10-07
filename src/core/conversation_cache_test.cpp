@@ -205,6 +205,67 @@ int main() {
               "an oversized put drops nothing");
     }
     {
+        // Keyless parking (prefix entries): the shareable root as `live`, no chain behind it.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({1, 2, 3, 4, 5})), "park A's prefix");
+        check(cache.put(image({1, 2, 3, 9})), "park B's prefix beside it");
+        const auto ma = cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6}, {}, true);
+        const auto mb = cache.best(std::vector<int64_t>{1, 2, 3, 9, 8}, {}, true);
+        check(ma.tokens == 5 && ma.live && ma.index == 0, "A's prompt hits A's prefix as live");
+        check(mb.tokens == 4 && mb.live && mb.index == 1, "B's prompt hits B's prefix, not A's");
+        SavedConversation keyed = image({1, 2, 3, 4, 50});
+        keyed.checkpoints = {cp({1, 2, 3, 4})};
+        check(cache.put(std::move(keyed)), "park a chain that holds A's root point");
+        check(cache.size() == 3 && cache.superseded() == 0, "a prefix entry is never superseded by a chain holding its point");
+        const auto longer = cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6}, {}, true);
+        check(longer.tokens == 5 && longer.live && longer.index == 0, "the prefix entry wins on length over the keyed checkpoint");
+        ConversationCache tight(1 << 20, 2);
+        tight.put(image({1, 2, 3, 4})); tight.put(image({1, 2, 3, 9}));
+        check(tight.best(std::vector<int64_t>{1, 2, 3, 9, 8}, {}, true).tokens == 4, "two prefixes coexist within the slots");
+        tight.put(image({1, 2, 3, 7}));
+        check(tight.evictions() == 1 && tight.best(std::vector<int64_t>{1, 2, 3, 4, 5}, {}, true).tokens == 0,
+              "a third prefix evicts the oldest");
+    }
+    {
+        // Hybrid keyless parking: the prefix entry and the full snapshot side by side.  A continuation of the
+        // conversation hits its live end; another job with the same system prompt hits the prefix entry - an
+        // equal-length checkpoint inside the snapshot must not steal the match, or a job that only needs the
+        // root consumes (and restores whole) the snapshot its owner continues from.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation p = image({1, 2, 3, 4});
+        p.prefix = true;                                      // parked first: the shareable root
+        check(cache.put(std::move(p)), "park the prefix entry");
+        SavedConversation f = image({1, 2, 3, 4, 5, 6});
+        f.checkpoints = {cp({1, 2, 3, 4})};                   // the same conversation's live end and chain
+        check(cache.put(std::move(f)), "park the full snapshot beside it");
+        const auto cont = cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6, 7}, {}, true);
+        check(cont.tokens == 6 && cont.live && cont.index == 1, "the continuation hits the full snapshot");
+        const auto other = cache.best(std::vector<int64_t>{1, 2, 3, 4, 9, 9}, {}, true);
+        check(other.tokens == 4 && other.live && other.index == 0,
+              "a different prompt with the same prefix hits the prefix entry, not the snapshot's checkpoint");
+    }
+    {
+        // The tight box: a byte budget that fits the prefix entry or the full snapshot, never both.  make_room
+        // refuses for the full snapshot instead of evicting the prefix entry parked by the same call - without
+        // the protection the hybrid would be worse than prefix-only parking on such a box.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation p = image({1, 2, 3, 4});
+        p.prefix = true;
+        SavedConversation f = image({1, 2, 3, 4, 5, 6});
+        f.checkpoints = {cp({1, 2, 3, 4})};
+        ConversationCache cache(p.bytes() + f.bytes() - 1, 4);   // one of the two at a time
+        check(cache.put(image({9, 8, 7})), "park an older entry");
+        check(cache.put(std::move(p)), "the prefix entry fits beside it");
+        check(!cache.make_room(f.bytes(), 0, 1), "the full snapshot is refused rather than evicting the fresh prefix");
+        check(cache.size() == 1 && cache.evictions() == 1, "protection evicts the older entry but never the new prefix");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4, 9}, {}, true).tokens == 4,
+              "the refused reservation leaves the prefix entry parked");
+        check(cache.make_room(f.bytes(), 0, 0), "the same reservation without protection fits by evicting it instead");
+        check(cache.size() == 0 && cache.evictions() == 2, "and it does: the prefix was the oldest entry left");
+    }
+    {
         ConversationCache disabled(0,4), no_slots(1024,0);
         check(!disabled.enabled() && !no_slots.enabled(), "both disable switches");
         check(!disabled.put(image({1,2,3})) && !no_slots.put(image({1,2,3})), "disabled cache stores nothing");
