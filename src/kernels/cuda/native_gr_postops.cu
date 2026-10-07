@@ -94,19 +94,6 @@ __global__ void post_multi(const float* residual, const float* __restrict__ bloc
     // Exact residual/output alias is supported; no other thread reads residual[i].
     output[i] = __fmaf_rn(block_out[d], weight, residual[i]);
 }
-// `post` for n tokens (blockIdx.y = token): the same expression per element
-__global__ void post_multi(const float* residual, const float* __restrict__ block_out,
-                           const float* __restrict__ inject, float* output, int n_embd, int hc, float scale,
-                           long long r_stride, long long b_stride, long long i_stride) {
-    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= std::size_t(n_embd) * hc) return;
-    const long long t = blockIdx.y;
-    residual += t * r_stride; output += t * r_stride; block_out += t * b_stride; inject += t * i_stride;
-    const int c = int(i / n_embd), d = int(i % n_embd);
-    const float weight = scale_zero_bias(sigmoid(scale_zero_bias(inject[c], scale)), 2.0f);
-    // Exact residual/output alias is supported; no other thread reads residual[i].
-    output[i] = __fmaf_rn(block_out[d], weight, residual[i]);
-}
 void check_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % alignof(float))
         throw std::invalid_argument("native GR postops require non-null four-byte aligned pointers");
