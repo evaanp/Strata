@@ -32,11 +32,9 @@ void native_gr_post(const float* residual, const float* block_out, const float* 
 void native_gr_post_multi(const float* residual, const float* block_out, const float* inject, float* output,
                           int n_embd, int hc, int n_tok, long long r_stride, long long b_stride, long long i_stride,
                           void* stream);
-<<<<<<< HEAD
 
 void native_gr_post_multi(const float* residual, const float* block_out, const float* inject,
                           float* output, int n_embd, int hc, int n_tok, void* stream);
-=======
->>>>>>> 5df6dc7 (Verify window: graph branches on the mixer, Q4_0 KV batched, PLE post-ops in one pass)
+)
 
 } // namespace strata::kernels

@@ -1287,7 +1287,6 @@ bool pdl_supported() {
     int s = state[dev].load(std::memory_order_relaxed);
     if (s == 0) {
         static const bool env_on = [] { const char* v = std::getenv("STRATA_DF_PDL"); return v == nullptr || std::atoi(v) != 0; }();
-)
         int major = 0;
         cudaFuncAttributes fa{};
         const bool on = env_on && cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&

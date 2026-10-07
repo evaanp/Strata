@@ -25,20 +25,15 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
-<<<<<<< HEAD
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
-    // Ordinary layer-split checkpoints retain each device's running state.
-    // Whole-session parking is currently single-GPU and rejects these parts.
-=======
     // The carve this payload was saved from. A part can only restore into the stage that owns it:
     // equal payload sizes alone cannot tell two same-sized carves with different ordinals apart.
     int64_t layer_lo = 0, layer_hi = 0;
     // Ordinary layer-split checkpoints retain each device's running state: this checkpoint is stage 0's
     // part, and `stage_parts` holds one part per later stage in stage order. Parking keeps them too.
->>>>>>> f504c2c (merge prefix-park-analysis onto v0.1.39: keep the hybrid keyless parking, disk parking, split checkpoints and placement scoring; drop what #559/#639/#650 now cover)
     std::vector<ConversationCheckpoint> stage_parts;
 
     size_t bytes() const {
@@ -277,19 +272,13 @@ public:
     bool make_room(size_t incoming, size_t held = 0, size_t protect = 0) {
         if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
         if (bytes() > budget_ - held - incoming) reuse_ = {};
-<<<<<<< HEAD
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+        while (entries_.size() > protect && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
             auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
             if (victim == entries_.end()) return false;
             bytes_ -= victim->bytes();
             entries_.erase(victim);
-=======
-        while (entries_.size() > protect && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            bytes_ -= entries_.front().bytes();
-            entries_.pop_front();
->>>>>>> f504c2c (merge prefix-park-analysis onto v0.1.39: keep the hybrid keyless parking, disk parking, split checkpoints and placement scoring; drop what #559/#639/#650 now cover)
             ++evictions_;
         }
         return entries_.size() < slots_ && bytes_ <= budget_ - held - incoming;

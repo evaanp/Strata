@@ -151,7 +151,6 @@ void full_session(int fmt, int mode, int experts) {
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
     fill(177);
     check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
-<<<<<<< HEAD
     {
         // disk save path: metadata + streamed K/V give the same file as the captured image
         SavedConversation meta;
@@ -181,8 +180,6 @@ void full_session(int fmt, int mode, int experts) {
         const ConversationView none{empty_ids,images,checkpoints,true};
         check(!conversation_snapshot_sources(meta,sources,none,ss,g,draft.state,err),"empty session refused");
     }
-=======
->>>>>>> 2d81ff6 (tests: conversation tests on v0.1.39 snapshot API - the split fixture parks through live_save/live_restore and the flat K/V entries; the transfer build wraps cudaGetDevice/SetDevice to prove each stage is drained and touched on its own card)
     check(a.live.dead!=b.live.dead,"different opening-state spare keys in regression fixture");
     auto bad=a; bad.kv.back().k.pop_back();
     check(conversation_snapshot_restore(bad,ss,g,draft.state,err)==ConversationRestore::invalid,
