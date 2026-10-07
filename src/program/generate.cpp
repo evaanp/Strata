@@ -8647,7 +8647,14 @@ int main(int argc, char** argv) {
         std::string fork_conv_owner;
         std::map<std::string, bool> fork_prot;
         auto park_current_body = [&](size_t held) -> bool {
-            if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            if (!conversations.enabled() || !live_ok || live.empty()) {
+                // the retained reuse image describes the conversation the session held when it was restored.
+                // With nothing live to park (it moved into a batch slot, the request was cancelled, the session
+                // was reset), a later park would reuse its bytes for a DIFFERENT conversation: drop it here,
+                // where the session gives its conversation up, not at the next park
+                conversations.take_reuse();
+                return true;
+            }
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
             // Named, so a stall report says "parking"; its copies beat (conversation_copy.hpp), so the watchdog
@@ -8727,7 +8734,7 @@ int main(int argc, char** argv) {
                 const std::vector<ConvCheckpoint> no_chain;
                 const strata::core::ConversationView view{ids, imgs,
                     root ? no_chain : (n_st > 0 ? cs.stage0 : checks), cvec_cached};
-                auto reuse = conversations.take_reuse();
+                auto reuse = conversations.take_reuse(ids, imgs);   // only bytes of THIS conversation may be reused
                 std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
                 stage_reuse.resize(n_st);
                 reuse.stages.clear();
@@ -12100,7 +12107,8 @@ int main(int argc, char** argv) {
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
-                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv));
+                    conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv),
+                                         live, live_imgs);   // these bytes belong to THIS conversation
                 }
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
@@ -14010,6 +14018,7 @@ int main(int argc, char** argv) {
                         live.clear();
                         live_imgs.clear();
                         checks.clear();
+                        conversations.take_reuse();   // the retained K/V described the conversation that moved out
                     }
                 }
                 if (cont) {
@@ -14049,6 +14058,8 @@ int main(int argc, char** argv) {
                         live.clear();
                         live_imgs.clear();
                         checks.clear();
+                        conversations.take_reuse();   // main holds nothing to park now; its retained K/V is another
+                                                      // conversation's (the slot's) and must not be reused for one
                     }
                 }
                 std::printf("BADM %d %d\n", admit_slot, cont ? 1 : 0);
