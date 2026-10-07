@@ -3698,11 +3698,6 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
         return prompt_tokens
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
 
-        if parser.rescued or parser.refused:
-            self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
-            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
-                  f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
-
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
     (StrataEngine.last): prompt_n is what was read, cache_n what the conversation cache already held.  None when the

@@ -11,7 +11,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-)
 #include <atomic>
 #include <cstdint>
 #include <cstdio>

@@ -31,7 +31,6 @@
 #if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
 #endif
-)
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -1167,7 +1166,6 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
                                          const Q81Block* STRATA_PDL_RESTRICT x,
                                          float* STRATA_PDL_RESTRICT y, int n_in, int n_out,
                                          const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr) {
-)
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
     int bxi = int(blockIdx.x);
@@ -1283,7 +1281,6 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
         if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, dim3(unsigned(n_out)), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
         return;
-)
     }
     constexpr int ROWS = 2;
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);

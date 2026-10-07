@@ -35,6 +35,5 @@ void native_gr_post_multi(const float* residual, const float* block_out, const f
 
 void native_gr_post_multi(const float* residual, const float* block_out, const float* inject,
                           float* output, int n_embd, int hc, int n_tok, void* stream);
-)
 
 } // namespace strata::kernels
