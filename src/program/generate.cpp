@@ -705,10 +705,6 @@ struct Options {
     int64_t conversation_disk_gib = 32;
     /// --serve SAVE: disk space a session file must leave free where it is written (MiB; 0 = no check)
     int64_t session_min_free_mib = 4096;
-    /// --serve: park conversations with a `conv=` id on disk under this directory (see conversation_disk.hpp); empty
-    /// = off.  Requests without an id still use the RAM cache (--conversation-cache-mib), so the two live side by side.
-    std::string conversation_disk_dir;
-    int64_t conversation_disk_gib = 32;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
@@ -7348,8 +7344,9 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        // `live_conv` (declared with the disk parking, above) is set once disk parking is on: a session that holds a
+        // `live_conv` (below) is set once disk parking is on: a session that holds a conversation with an id was parked
         // conversation with an id was parked on disk already (park_disk), so only a session without one goes to RAM.
+        std::string live_conv;
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             if (!live_conv.empty()) return true;
@@ -7517,46 +7514,6 @@ int main(int argc, char** argv) {
             if (live.size() > (has_root ? keep->ids.size() : 0) &&
                 !park_view(live, live_imgs, nullptr, parked_here, stored)) return false;
             return true;
-        };
-        // ---- disk parking (--conversation-disk-dir): `live_conv` is the id of the conversation the session holds, and
-        // `disk_unchanged` how many of its leading tokens still have byte-identical K/V in that id's files - set when it
-        // was parked or restored, lowered to where each request starts rewriting the session.  A park then writes only
-        // the K/V past it.
-        strata::core::ConversationDisk disk;
-        if (o.prompt_cache > 0 && !o.conversation_disk_dir.empty()) {
-            if (!disk.open(o.conversation_disk_dir, (uint64_t) o.conversation_disk_gib << 30, err)) {
-                std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                return 1;
-            }
-            std::fprintf(stderr, "strata serve: conversation disk: parking in %s (budget %lld GiB)\n",
-                         o.conversation_disk_dir.c_str(), (long long) o.conversation_disk_gib);
-        }
-        int64_t disk_unchanged = 0;
-        // the sessions disk parking captures and restores: the main session (the caller's current device is its
-        // stage), then each later split stage on its own GPU, and the drafter, which lives on the last one
-        auto park_set = [&]() {
-            strata::core::ConversationStageSet s;
-            s.stages.push_back({&ss, -1});
-            for (auto& st : stages) s.stages.push_back({&st->ss, st->dev});
-            s.draft = &mtp.kv_state_rw();   // parking restores INTO it; #646 split the accessor
-            return s;
-        };
-        auto park_disk = [&]() {
-            if (!disk.enabled() || live_conv.empty() || !live_ok || live.empty()) return;
-            const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
-            strata::core::ConversationDisk::Stats st;
-            const auto t0 = Clock::now();
-            if (!disk.park(live_conv, view, park_set(), g, disk_unchanged, st, err)) {
-                std::fprintf(stderr, "strata serve: conversation disk: skip parking %s (%s)\n", live_conv.c_str(),
-                             err.c_str());
-                err.clear();   // a miss, not a request error
-                return;
-            }
-            disk_unchanged = (int64_t) live.size();
-            std::fprintf(stderr, "strata serve: conversation disk: parked %s: %zu tokens in %.1f ms, wrote %.1f MiB, "
-                                 "kept %.1f MiB; parked=%zu on_disk=%.1f GiB evicted=%zu\n",
-                         live_conv.c_str(), live.size(), std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                         st.written / 1048576.0, st.kept / 1048576.0, disk.size(), st.on_disk / 1073741824.0, st.evicted);
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server

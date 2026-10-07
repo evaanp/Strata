@@ -49,6 +49,11 @@ class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hp
 class RemoteExperts;
 struct LoadStats;
 
+/// How many helper expert tiers a dispatch can consult: one per GPU this engine will use.  Three used to be
+/// the ceiling because a tier had to run on a card no stage ran on; a layer split now spills each card's
+/// leftover VRAM into a tier, CUDA0 included, so all four fit.
+inline constexpr int kRemoteMax = 4;
+
 namespace detail {
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
@@ -287,7 +292,10 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
-    RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
+    /// One per card this engine can use: the explicit `--expert-cache-deviceN` tiers, or (with a layer split)
+    /// the automatic spill tier each card's leftover VRAM funds - a card can be both a stage and a tier, so
+    /// this is the GPU count, not "the GPUs no stage runs on".
+    RemoteExperts* remote[kRemoteMax] = {};
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
 
@@ -540,6 +548,13 @@ public:
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
+    /// --lock-experts-gib: mlock (`lock`) or munlock one expert's three role slices where the GGUF is mapped, so
+    /// the OS file cache keeps exactly the experts no GPU slot holds.  A lock rounds out to whole pages; an unlock
+    /// rounds in, except at an end whose neighbouring expert (`prev_locked` / `next_locked`) is not locked, so a
+    /// page two experts share is never unlocked under the one that stays.  Only in GGUF mode.  Returns the slices'
+    /// bytes, or -1 (not mapped, or the kernel refused: errno says why).
+    int64_t lock_mapped_expert(int64_t layer, int64_t expert, bool lock, bool prev_locked = false,
+                               bool next_locked = false);
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }
     /// The exchange buffers are page-locked (cudaHostAlloc): copies to and from them are asynchronous.
