@@ -49,6 +49,11 @@ class PeerExperts;   // multi-GPU: the second GPU's expert tier (peer_experts.hp
 class RemoteExperts;
 struct LoadStats;
 
+/// How many helper expert tiers a dispatch can consult: one per GPU this engine will use.  Three used to be
+/// the ceiling because a tier had to run on a card no stage ran on; a layer split now spills each card's
+/// leftover VRAM into a tier, CUDA0 included, so all four fit.
+inline constexpr int kRemoteMax = 4;
+
 namespace detail {
 
 /// Sentinel used by the pure complement planner for a blob that remains in the mmap fallback.
@@ -123,6 +128,18 @@ int64_t choose_resident_keep_from(const std::vector<uint64_t>& slot_bytes, uint6
 /// The adaptive tier swapped `in` into a GPU slot and `out` out of it: `out` takes `in`'s place in the compact copy
 /// (the caller copies out's bytes there).  False, and nothing changed, unless `in` is in the copy and `out` is not.
 bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t out);
+
+/// A layer split: add each stage's lend region to a plan built from the complement plus every stage's
+/// cache (the `additional_gpu_pairs` shape).  Each region lists one stage's (layer, expert) pairs, the
+/// pairs in its cache's highest slots first - the slots the prompt path borrows, from the tail in.  A pair
+/// already in the plan is passed over; a stage's walk stops at the first pair that does not fit `cap_bytes`
+/// and the NEXT stage's walk still runs (the pairs past the cap keep the mapped-file fallback they had).
+/// Returns the pairs added, or -1 - leaving the plan untouched - when a pair is outside the geometry or a
+/// region repeats one.
+int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+                                  std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
+                                  const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
+                                  std::string& err);
 
 }  // namespace detail
 
@@ -293,7 +310,10 @@ struct ExpertDispatch {
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts
-    RemoteExperts* remote[3] = {}; ///< optional CUDA1..3 tiers for otherwise CPU-served rows
+    /// One per card this engine can use: the explicit `--expert-cache-deviceN` tiers, or (with a layer split)
+    /// the automatic spill tier each card's leftover VRAM funds - a card can be both a stage and a tier, so
+    /// this is the GPU count, not "the GPUs no stage runs on".
+    RemoteExperts* remote[kRemoteMax] = {};
     int remote_count = 0;
     int64_t n_expert = strata::kernels::cpu::NE;
 
@@ -516,6 +536,15 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
+    /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
+    /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
+    /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
+    /// as the borrowing takes them.  Pairs past the budget keep the mapped-file fallback.  Empty (the
+    /// default) keeps #848's shape: with `additional_gpu_pairs` the single lend region is off and the copy
+    /// holds only the complement.
+    void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
+        stage_lend_regions_ = std::move(regions);
+    }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -537,6 +566,13 @@ public:
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
+    /// --lock-experts-gib: mlock (`lock`) or munlock one expert's three role slices where the GGUF is mapped, so
+    /// the OS file cache keeps exactly the experts no GPU slot holds.  A lock rounds out to whole pages; an unlock
+    /// rounds in, except at an end whose neighbouring expert (`prev_locked` / `next_locked`) is not locked, so a
+    /// page two experts share is never unlocked under the one that stays.  Only in GGUF mode.  Returns the slices'
+    /// bytes, or -1 (not mapped, or the kernel refused: errno says why).
+    int64_t lock_mapped_expert(int64_t layer, int64_t expert, bool lock, bool prev_locked = false,
+                               bool next_locked = false);
     bool reserve_exchanges(int64_t n, std::string& err);
     int64_t exchange_capacity() const { return xstage_cap_; }
     /// The exchange buffers are page-locked (cudaHostAlloc): copies to and from them are asynchronous.
@@ -776,6 +812,7 @@ private:
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
+    std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;

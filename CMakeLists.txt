@@ -447,7 +447,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp
-    src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/conversation_disk.cpp src/core/arch_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/exchange_storage_test.cpp")
@@ -468,6 +468,29 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(vmm_test PRIVATE strata_engine)
     add_test(NAME vmm_test COMMAND vmm_test)
     set_tests_properties(vmm_test PROPERTIES TIMEOUT 60)
+    # The resident RAM mode with a layer split: the copy keeps each stage's lend region, and the experts the
+    # prompt path borrows are served from RAM (the file source reads none of them).  The device calls are
+    # wrapped - conversation_transfer_test's pattern - and `pin = false` keeps the copy pageable, so this
+    # runs on a CPU-only PC.
+    if(NOT STRATA_ENABLE_HIP AND UNIX AND NOT APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      add_executable(split_lend_complement_test tests/core/split_lend_complement_test.cpp)
+      target_link_libraries(split_lend_complement_test PRIVATE strata_engine)
+      target_link_options(split_lend_complement_test PRIVATE
+        -Wl,--wrap=cudaMalloc -Wl,--wrap=cudaFree -Wl,--wrap=cudaMemset -Wl,--wrap=cudaMemcpy
+        -Wl,--wrap=cudaMemcpyAsync -Wl,--wrap=cudaStreamSynchronize -Wl,--wrap=cudaDeviceSynchronize
+        -Wl,--wrap=cudaGetLastError -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice
+        -Wl,--wrap=cudaMemGetInfo -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
+      add_test(NAME split_lend_complement_test COMMAND split_lend_complement_test)
+      set_tests_properties(split_lend_complement_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+    endif()
+  endif()
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/remote_budget_test.cpp")
+    # The helper tiers' pair selection (the spill tier a layer split opens on every card).  No GPU: the walk is
+    # pure arithmetic, and CUDA_VISIBLE_DEVICES=-1 keeps a stray context from being created for the link alone.
+    add_executable(remote_budget_test tests/core/remote_budget_test.cpp)
+    target_link_libraries(remote_budget_test PRIVATE strata_engine)
+    add_test(NAME remote_budget_test COMMAND remote_budget_test ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/native_experts)
+    set_tests_properties(remote_budget_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 60)
   endif()
   # #477: the learned expert profile (--expert-profile-save): its order and make_profile.py's file format (CPU only)
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/expert_profile_save_test.cpp")
@@ -520,7 +543,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(conversation_transfer_test src/core/conversation_validation_test.cpp)
       target_compile_definitions(conversation_transfer_test PRIVATE CONVERSATION_TEST_TRANSFERS)
       target_link_options(conversation_transfer_test PRIVATE
-        -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError)
+        -Wl,--wrap=cudaMemcpy -Wl,--wrap=cudaDeviceSynchronize -Wl,--wrap=cudaGetLastError
+        -Wl,--wrap=cudaGetDevice -Wl,--wrap=cudaSetDevice
+        -Wl,--wrap=cudaHostAlloc -Wl,--wrap=cudaFreeHost)
       target_link_libraries(conversation_transfer_test PRIVATE strata_engine)
       add_test(NAME conversation_transfer_test COMMAND conversation_transfer_test)
       set_tests_properties(conversation_transfer_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
@@ -946,7 +971,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q4_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q4_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q4_parity COMMAND kv_q4_parity)
-  # the verify window's one-launch forms (hyper-connection write, PLE post-ops with the commit's
+  # the verify window's one-launch forms (Q4_0 K/V append, hyper-connection write, PLE post-ops with the commit's
   # history snapshots) vs the per-token launches they replace, bitwise (GPU, synthetic, no model)
   add_executable(verify_batch_parity src/kernels/verify_batch_parity.cpp)
   target_include_directories(verify_batch_parity PRIVATE ${_strata_gpu_include_directories})
@@ -1072,6 +1097,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(spec_prob_test src/core/spec_prob_test.cpp)
   target_include_directories(spec_prob_test PRIVATE include)
   add_test(NAME spec_prob_test COMMAND spec_prob_test)
+  # the pipelined loop's penalty-history bookkeeping vs the serial loop's (header-only, CPU)
+  add_executable(penalty_hist_test src/core/penalty_hist_test.cpp)
+  target_include_directories(penalty_hist_test PRIVATE include)
+  add_test(NAME penalty_hist_test COMMAND penalty_hist_test)
   # the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)

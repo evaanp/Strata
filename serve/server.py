@@ -21,6 +21,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import collections
 import base64
@@ -977,7 +978,17 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
-        return keys + StrataEngine.projection_key(sampling)
+        return keys + StrataEngine.projection_key(sampling) + StrataEngine.conversation_key(sampling)
+
+    CONVERSATION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+    @staticmethod
+    def conversation_key(sampling: dict) -> str:
+        """`conv=ID`: the client's conversation id (header X-Strata-Conversation or body field strata_conversation).
+        An engine started with --conversation-disk-dir parks only conversations that carry one; an id that is not a
+        plain token is dropped rather than passed on (the GEN line is space-separated)."""
+        cid = sampling.get("strata_conversation")
+        return f" conv={cid}" if isinstance(cid, str) and StrataEngine.CONVERSATION_ID.fullmatch(cid) else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1815,10 +1826,26 @@ def vision_start_error(line: str, log=None) -> str:
     return "the vision encoder did not start: " + text
 
 
+def _free_vram_mib(index: int) -> int | None:
+    """Free VRAM on one card, from NVML (AMD backend: amdgpu's sysfs, #301); None when it can't be read.
+
+    `Service.free_vram_mib()` asks the same of the engine's card.  This one takes the index because the encoder
+    and the engine can be on different cards (the config's own `cuda_device`, #408) - and because the encoder is
+    asked at a moment when the engine is not loaded yet.  It goes through telemetry's reader."""
+    try:
+        from serve.telemetry import free_vram_mib
+        return free_vram_mib(int(index or 0))
+    except Exception:  # noqa: BLE001 - telemetry must never take the server down
+        return None
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
+
+    device = 0                  # class defaults so `__new__`-built instances stay readable
+    mib: int | None = None
 
     @staticmethod
     def work_dir() -> Path:
@@ -1840,7 +1867,7 @@ class Vision:
                 pass
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False, device: int = 0):
         absolute = lambda p: os.path.abspath(p) if os.path.dirname(str(p)) else p   # the encoder runs in its own dir (#480)  # noqa: E731
         args = [absolute(cfg["exe"]), "--mmproj", absolute(cfg["mmproj"]), "--model", absolute(cfg["model"])]
         if cfg.get("gpu"):
@@ -1853,6 +1880,11 @@ class Vision:
             args += ["--min-tokens", str(cfg["min_tokens"])]
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
+        # There is no device flag to pass: mtmd takes device 0 of CUDA_VISIBLE_DEVICES, which child_env builds
+        # from the config's own GPU list (or vision_env pins one card, #408), so this is the card the encoder
+        # lands on.  Kept so the Monitor can show its footprint on that card rather than on the engine's.
+        self.device = int(device or 0)
+        self.mib: int | None = None                     # the VRAM it holds; None = not measured
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -1862,6 +1894,11 @@ class Vision:
 
     def _start(self):
         args, log, env = self.spawn
+        # The encoder is a separate process and reports no memory of its own - not in its stdout, not in its log -
+        # so its footprint is what this card's free VRAM lost while it started.  It runs a 2048px warm-up before
+        # printing READY (tools/vision/strata_vision.cpp), so every buffer it will ever need is already allocated
+        # by the time `after` is read.
+        before = _free_vram_mib(self.device)
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
@@ -1882,6 +1919,13 @@ class Vision:
                 pass
             raise RuntimeError(vision_start_error(line, self.spawn[1]))
         self.stopped = False
+        after = _free_vram_mib(self.device)
+        # A real encoder is hundreds of MiB to ~1.5 GB (docs/DETAILS.md quotes ~1.4 GB, setup reserves 700 MiB), so
+        # anything outside 64..8192 is noise rather than this process: a CPU-mode encoder takes no VRAM at all, an
+        # unreadable card gives None, and on a restart the killed process has not released its memory yet.
+        if before is not None and after is not None and 64 <= before - after <= 8192:
+            self.mib = before - after
+        # Otherwise the last good reading stands.  A wrong number here is worse than no number.
 
     def _readline(self, timeout: float, what: str) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
@@ -2457,6 +2501,73 @@ class ByteTokenizer:
         return raw.decode("utf-8", errors=errors)
 
 
+class SampledTails:
+    """The ids the engine holds for each conversation (its prompt plus what it sampled), so a client that sends the
+    same text back gets the same ids back.
+
+    A model can sample a split the tokenizer would never produce (a rare character as two tokens where the
+    vocabulary has one).  The client renders that text again, the tokenizer merges it, and from that token on the
+    prompt no longer continues the engine's live end: the engine falls back to its last checkpoint and reads
+    thousands of tokens again (6834 after a 16K-character tool call, 2026-10-02).  `splice` puts the sampled ids
+    back wherever the bytes are the same.  Only with a tokenizer that has `token_bytes`: comparing decoded text
+    would call two different halves of a character equal (both decode to U+FFFD)."""
+
+    def __init__(self, keep: int = 32):
+        self.keep, self.held = keep, collections.OrderedDict()
+
+    def record(self, conversation: str, ids: list[int]):
+        self.held[conversation] = array.array("i", ids)   # 4 bytes a token, not a list's ~36
+        self.held.move_to_end(conversation)
+        while len(self.held) > self.keep:
+            self.held.popitem(last=False)
+
+    def splice(self, conversation: str, ids: list[int], tok) -> list[int]:
+        held = self.held.get(conversation)
+        token_bytes = getattr(tok, "token_bytes", None)
+        if not held or token_bytes is None:
+            return ids
+        d = 0
+        for a, b in zip(held, ids):
+            if a != b:
+                break
+            d += 1
+        if d == len(held) or d == len(ids):
+            return ids
+        # walk both from the first different id; (j, k) is the last point where both sides have produced the same
+        # bytes and end on a token boundary
+        i, k, best = d, d, None
+        mine, theirs = b"", b""
+        while True:
+            if len(mine) == len(theirs):
+                if mine != theirs:
+                    break
+                if i > d:
+                    best = (i, k)
+                mine = theirs = b""
+                if i == len(held) or k == len(ids):
+                    break
+                mine, theirs = token_bytes(held[i]), token_bytes(ids[k])
+                i, k = i + 1, k + 1
+            elif len(mine) < len(theirs):
+                if i == len(held) or not theirs.startswith(mine):
+                    break
+                mine += token_bytes(held[i])
+                i += 1
+            else:
+                if k == len(ids) or not mine.startswith(theirs):
+                    break
+                theirs += token_bytes(ids[k])
+                k += 1
+        if best is None:
+            return ids
+        j, k = best
+        window = lambda xs, at: ",".join(str(x) for x in xs[max(0, at - 4):at]) + "|" + \
+            ",".join(str(x) for x in xs[at:at + 8])
+        print(f"[strata] conversation {conversation or '-'}: kept {j - d} sampled ids for {k - d} the prompt had at "
+              f"{d} of {len(ids)}; sampled={window(held, d)} prompt={window(ids, d)}", flush=True)
+        return ids[:d] + held[d:j].tolist() + ids[k:]
+
+
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
@@ -2622,6 +2733,7 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.tails = SampledTails()                     # the sampled ids per conversation (see SampledTails)
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -2770,6 +2882,22 @@ class Service:
 
     def _vision_down(self) -> bool:
         return self.vision is not None and hasattr(self.vision, "alive") and not self.vision.alive()
+
+    def vision_metrics(self) -> dict:
+        """The encoder's line in /metrics: configured or not, process up or not, and which card holds it with how
+        much VRAM.  Everything is `getattr`, because a test stands a bare double in for the encoder (test_server
+        has one with only `encode`) and the Monitor must not depend on what that double happens to implement."""
+        v = self.vision
+        if v is None:
+            return {"enabled": False, "running": False, "device": None, "mib": None}
+        alive = getattr(v, "alive", None)
+        running = True if alive is None else bool(alive())
+        # `device` is a config index - the same numbering as hardware.gpus[].index - so the Monitor can put the row
+        # on the card whose NVML index matches.  `mib` is reported only while the process is up: an unloaded
+        # encoder really has given its VRAM back, and showing the last measurement next to a stopped process would
+        # read as if it were still holding it.
+        return {"enabled": True, "running": running, "device": getattr(v, "device", None),
+                "mib": getattr(v, "mib", None) if running else None}
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from NVML (AMD backend: amdgpu's sysfs files, #301); None when it can't
@@ -3099,7 +3227,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "vision": self.vision_metrics(), "live": live,
+                "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -3485,7 +3614,16 @@ class Service:
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
-                    prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    conversation = str((sampling or {}).get("strata_conversation") or "")
+                    prompt, thought = self.tails.splice(conversation, ids, self.tok), 0   # thought: the reasoning
+                    # thought: the reasoning tokens so far (the budget's).  The budget was cut for `ids`; a
+                    # splice that puts back more sampled ids than the tokenizer's merges makes the prompt longer,
+                    # and a client that asks for exactly the room left (PLA does) then went over by those few
+                    # tokens: the engine refused the request (conv 60158, 2026-10-03:
+                    # 51349 + 102244 + 8 > 153600).  Give them up from max_new.
+                    over = len(prompt) + max_new + CTX_SLACK - getattr(self.engine, "max_context", 1 << 62)
+                    if over > 0 and len(prompt) > len(ids):
+                        max_new -= min(over, len(prompt) - len(ids))
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -3508,6 +3646,7 @@ class Service:
                                 if t in self.stop_ids:
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    seg.append(t)           # sampled like the rest (SampledTails)
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -3663,6 +3802,8 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                    else:                               # a cancelled request leaves the engine without a live end
+                        self.tails.record(conversation, prompt + seg)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -3771,7 +3912,6 @@ def prompt_tokens_seen(prompt_tokens: int, last: dict) -> int:
     if read is None or last.get("finish") != "cancel":
         return prompt_tokens
     return min(prompt_tokens, int(last.get("reused") or 0) + int(read))
-
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
@@ -4673,6 +4813,9 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    cid = self.headers.get("X-Strata-Conversation")
+                    if cid:
+                        req["strata_conversation"] = cid.strip()
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -4691,6 +4834,8 @@ def make_handler(svc: Service):
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
                     self._count_tokens(req)
+                elif path in ("/tokenize", "/detokenize", "/apply-template"):
+                    self._tokenizer_route(path, req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except ValueError as e:
@@ -5164,6 +5309,38 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             stop_strings(req)                                 # the same 400 as the request itself would get
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _tokenizer_route(self, path, req):
+            """llama-server's /tokenize, /detokenize and /apply-template, so a client can see the ids and the prompt
+            this server reads without running the model (the tokenizer and template live here, not in the engine)."""
+            if path == "/tokenize":
+                content = req.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("'content' must be a string")
+                # JSON may carry half of a surrogate pair (a client that cut a string inside an emoji: PLA's in-turn
+                # fold did, and a 400 here made it estimate characters / 4 exactly when the window fit mattered).
+                # Count it as one replacement character, and say where it was so the client can be fixed.
+                clean = content.encode("utf-8", "replace").decode("utf-8")
+                if clean != content:
+                    at = next(i for i, c in enumerate(content) if 0xD800 <= ord(c) <= 0xDFFF)
+                    print(f"[strata] /tokenize: a lone surrogate at {at} of {len(content)}, counted as one character: "
+                          f"{content[max(0, at - 60):at + 20].encode('utf-8', 'backslashreplace').decode()!r}", flush=True)
+                ids = svc.tok.encode(clean, parse_special=req.get("parse_special", True) is not False)
+                if req.get("with_pieces"):
+                    self._json(200, {"tokens": [{"id": t, "piece": svc.tok.decode([t])} for t in ids]})
+                else:
+                    self._json(200, {"tokens": ids})
+            elif path == "/detokenize":
+                ids = req.get("tokens")
+                if not isinstance(ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) for t in ids):
+                    raise ValueError("'tokens' must be a list of token ids")
+                try:
+                    self._json(200, {"content": svc.tok.decode(ids)})
+                except (IndexError, KeyError) as e:
+                    raise ValueError(str(e)) from None
+            else:
+                messages, tools, kw = openai_to_messages(svc.with_shared(req, "openai"))
+                self._json(200, {"prompt": svc.template.render(messages, tools=tools, **kw)})
 
         def _anthropic(self, req):
             svc.load()
@@ -5693,7 +5870,11 @@ def main() -> int:
                         if k in ("exe", "mmproj", "model") and isinstance(v, str) and not os.path.isabs(v) else v)
                     for k, v in cfg["vision"].items()}
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+                            env=vision_env(cfg, env), lazy=lazy,
+                            # the card the encoder lands on: the config's own `cuda_device` when it names one
+                            # (#408), else child_env's first GPU - the Monitor shows its footprint there
+                            device=(vcfg.get("cuda_device") if vcfg.get("cuda_device") is not None
+                                    else (gpu_list(cfg) or [0])[0]))
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
