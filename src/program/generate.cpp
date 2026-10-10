@@ -4605,6 +4605,10 @@ int main(int argc, char** argv) {
     };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
+    // fork(ADR-0005 D2): the batch-MTP refusal reason captured for the CAP handshake line after READY (:8810):
+    // a pointer to the :4116-4118 reason string, null = on. The prose stays the operator channel (:4120);
+    // CAP carries the tokenized form.
+    const char* batch_mtp_why = nullptr;
     if (batch_mtp) {
         // (--pipeline-windows is already off with --batch slots)
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
@@ -4624,6 +4628,7 @@ int main(int argc, char** argv) {
             why = "it is not run with helper expert caches on a layer split";
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
+            batch_mtp_why = why;   // fork(ADR-0005 D2): capture the decision's reason (CAP mapping below READY)
             batch_mtp = false;
         }
     }
@@ -8246,6 +8251,13 @@ int main(int argc, char** argv) {
         // `live_conv` (below) is set once disk parking is on: a session that holds a conversation with an id was parked
         // conversation with an id was parked on disk already (park_disk), so only a session without one goes to RAM.
         std::string live_conv;
+        // fork(ADR-0005 D4): the conv token of the session currently held, mirrored for the RAM cache's park
+        // surface. live_conv moves only under --conversation-disk-dir (set at :10156, gated at :10154) and RAM
+        // parking is gated on it (:7487); the RAM cache parks keyless sessions too, so it needs its own owner
+        // token. fork_prot: the PROT-marked tokens; a parked entry inherits its token's flag at park time below,
+        // and PROT also flips entries already resident (ConversationCache::set_prot).
+        std::string fork_conv_owner;
+        std::map<std::string, bool> fork_prot;
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
@@ -8301,6 +8313,22 @@ int main(int argc, char** argv) {
             auto park_view = [&](const std::vector<int32_t>& ids, const std::vector<ImgKey>& imgs,
                                  const ConvCheckpoint* root, size_t protect, bool& stored) -> bool {
                 stored = false;
+                strata::core::ConversationCache::Room room;   // fork(ADR-0005 D5): victim identity + refusal cause
+                // fork(ADR-0005 D5): the conv token this entry parks under ('-' when the session
+                // carries none - the RAM cache's keyless mode). Additive stdout verbs only, never fields
+                // appended to an existing line: server.py queues every stdout line (server.py:729-748) and its
+                // consumers skip unrecognized verbs (control loop :1006-1042, token loop :1485-1514 - if/elif
+                // chains with no else), so PKINFO/PKREFUSE are inert for the serve front-end; the shim reads
+                // them off the stream and correlates by this token.
+                const char* ctok = fork_conv_owner.empty() ? "-" : fork_conv_owner.c_str();
+                auto evicted_field = [](const strata::core::ConversationCache::Room& r) {
+                    std::string out;
+                    for (size_t k = 0; k < r.victims.size(); ++k) {   // cap 8: enforced in evict_oldest (hpp:342)
+                        if (k) out += ',';
+                        out += r.victims[k].empty() ? "-" : r.victims[k];
+                    }
+                    return out.empty() ? std::string("-") : out;
+                };
                 strata::core::ConversationCheckpointSplit cs;
                 if (root == nullptr && n_st > 0)
                     cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
@@ -8361,9 +8389,14 @@ int main(int argc, char** argv) {
                 // estimate must stay uncapped: it counts the retained buffers'
                 // capacity and directories, and put() charges that same true size -
                 // a capped figure would under-evict and overfill the budget.
-                if (!conversations.make_room(estimate, held, protect)) {
+                if (!conversations.make_room(estimate, held, protect, &room)) {   // fork(ADR-0005 D5): report via room
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (snapshot %zu MiB exceeds available budget)\n",
                                  estimate >> 20);
+                    // fork(ADR-0005 D5): the two make_room causes named on the protocol - byte_budget is the stderr
+                    // line above (budget bound, conversation_cache.hpp:292), protected_only is nothing-evictable
+                    // (only pinned/protected left, hpp:341/:307)
+                    std::printf("PKREFUSE %s reason=%s\n", ctok, room.refuse == 2 ? "protected_only" : "byte_budget");
+                    std::fflush(stdout);
                     return true;
                 }
                 const auto t0 = Clock::now();
@@ -8381,6 +8414,8 @@ int main(int argc, char** argv) {
                     // /proc/meminfo; no waiting is needed.  slots() bounds the loop, and the two lines
                     // below say what it did either way.  The reading is the guard's (MemAvailable, the cgroup
                     // limits above the engine, --memory-limit-mib); `mem` keeps the last one for the refusal line.
+                    // fork(ADR-0005 D5): this loop's victims share `room` with make_room's - PKINFO's
+                    // evicted= reports every entry this park call evicted, budget loop and RAM gate alike.
                     size_t evicted = 0;
                     std::optional<strata::core::HostMemoryReading> mem;
                     auto admit = [&] {
@@ -8389,12 +8424,16 @@ int main(int argc, char** argv) {
                             mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                     };
                     while (!admit() && conversations.size() > 0 && evicted < conversations.slots() &&
-                           conversations.evict_oldest())
+                           conversations.evict_oldest(&room))
                         ++evicted;
                     if (!admit()) {
                         std::fprintf(stderr, "strata serve: conversation cache: skip parking (physical RAM admission; need %zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                      additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
                                      evicted, conversations.size());
+                        // fork(ADR-0005 D5): the RAM-floor refusal named on the protocol (conversation_memory_admit,
+                        // conversation_memory.hpp:14-17, floor = --conversation-cache-min-free-mib)
+                        std::printf("PKREFUSE %s reason=ram_floor\n", ctok);
+                        std::fflush(stdout);
                         return true;
                     }
                     if (evicted)
@@ -8432,15 +8471,48 @@ int main(int argc, char** argv) {
                             mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                         std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
                                      (long long) o.conversation_cache_min_free_mib, ram_note(mem_after).c_str());
+                        // fork(ADR-0005 D5): RAM-floor refusal after the capture (same floor test, :7632's twin)
+                        std::printf("PKREFUSE %s reason=ram_floor\n", ctok);
+                        std::fflush(stdout);
                         return true;
                     }
+                    // fork(ADR-0005 D4): stamp the entry with its conversation identity and protection AT PARK
+                    // time: inherited from the PROT map exactly as the request-key pin=N mark is set at run time
+                    // and never stored in a session file (conversation_cache.hpp:29-32; pin parsed per
+                    // request at :9679-9704).
+                    image.conv = fork_conv_owner;
+                    image.prot = !fork_conv_owner.empty() && fork_prot.count(fork_conv_owner) &&
+                                 fork_prot[fork_conv_owner];
+                    // fork(ADR-0005 D5/D4): the entry's extent, carve geometry AND protect flag for PKINFO,
+                    // captured before put()
+                    // moves the image. extent = the parked token count (upto = view.ids.size(),
+                    // conversation_state.cpp:265 - the same figure the stderr line below prints); carve = this
+                    // image's stage-0 layer range (conversation_cache.hpp:156) and one part per later
+                    // stage (:162 stage_images, the park-side twin of ConversationCheckpoint::stage_parts, :37-38).
+                    const size_t pk_ext = root ? root->ids.size() : ids.size();
+                    const long long pk_lo = (long long) image.layer_lo, pk_hi = (long long) image.layer_hi;
+                    const size_t pk_parts = image.stage_images.size();
+                    const int pk_prot = (int) image.prot; // fork(ADR-0005 D4): the flag the shim observes
                     const size_t snapshot_bytes = image.bytes();
-                    stored = conversations.put(std::move(image), held);
+                    stored = conversations.put(std::move(image), held, &room);   // fork(ADR-0005 D5): room passthrough
                     std::fprintf(stderr, "strata serve: conversation cache: %s%s%zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                                  stored ? "parked" : "skipped", root ? " prefix " : " ",
                                  root ? root->ids.size() : ids.size(),
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                                  conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                // fork(ADR-0005 D5): the machine-readable park ack - one line per entry this call stored or
+                // refused (one park_current_body can park two entries, :7725/:7731, so a conversation's
+                // admission can carry up to two). evicted = conv tokens of make_room's victims (cap 8, '-' when
+                // none); both make_room calls of this park - the one at :7598 above and put()'s own
+                // (conversation_cache.hpp:393) - share this room. prot= (fork ADR-0005 D4) trails the contract's
+                // fields so a k=v reader that only knows ext/carve/evicted ignores it (PKINFO is a fork-only verb,
+                // server.py never parses it) and the flag is observable per parked entry.
+                if (stored)
+                    std::printf("PKINFO %s ext=%zu carve=%lld:%lld/%zu evicted=%s prot=%d\n",
+                                ctok, pk_ext, pk_lo, pk_hi, pk_parts, evicted_field(room).c_str(), pk_prot);
+                else
+                    std::printf("PKREFUSE %s reason=%s\n", ctok, room.refuse == 2 ? "protected_only" : "byte_budget");
+                std::fflush(stdout);
                 } catch (const std::bad_alloc&) {
                     // The active state has not been touched. Continue with normal
                     // prompt processing rather than killing a serving process.
@@ -9718,6 +9790,32 @@ int main(int argc, char** argv) {
         }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
+        // fork(ADR-0005 D2): CAP handshake line, an ADDITIVE stdout line directly after READY (:8810).
+        // server.py queues every line in its pump (server.py:729-748) and its READY scan skips unknown verbs
+        // (server.py:812), so this line is inert for the front-end. Values are the config-time decisions
+        // themselves, nothing recomputed: batch_slots = o.batch after the batch-off switch (:4128-4132) and
+        // the kVerifyMaxT row-cap trim (:4133-4136); batch_rows_max = that cap (:4127); batch_mtp = the
+        // decided local (:4110; gate :4115-4124); mtp_spec = o.spec, the draft/verify depth after
+        // the --mtp-max-t and kVerifyMaxT clamps (:2344/:2349); layer_split = n_stages > 1 (:7107).
+        // mtp_why: the refusal reason (:4116-4118, captured at :4121) as ONE token, '-' when on.
+        {
+            const char* cap_why = !batch_mtp_why ? "-"
+                : std::strcmp(batch_mtp_why, "it needs --batch 2 or more") == 0 ? "needs_batch2"
+                : std::strcmp(batch_mtp_why, "it needs --mtp") == 0 ? "needs_mtp"
+                : std::strcmp(batch_mtp_why, "it needs --spec T (T >= 2)") == 0 ? "needs_spec"
+                : std::strcmp(batch_mtp_why, "it needs each stage of a layer split on its own GPU") == 0 ? "split_same_gpu"
+                : std::strcmp(batch_mtp_why, "it does not combine with --batch-groups (pipelined slot groups) yet") == 0 ? "no_batch_groups"
+                : std::strcmp(batch_mtp_why, "a layer split with --batch pipelines the slots in groups by default and the pipelined groups run no slot "
+                  "drafts (4 streams on 2 GPUs: 25-30% faster than the serial MTP windows); --batch-groups 1 or "
+                  "STRATA_BATCH_MTP_SERIAL=1 keeps --batch-mtp with serial windows (fewer streams, or when prompts arrive "
+                  "rarely, it can be the faster choice)") == 0 ? "default_pipelined_groups"
+                : std::strcmp(batch_mtp_why, "it is not run with helper expert caches on a layer split") == 0 ? "no_helper_caches"
+                : std::strcmp(batch_mtp_why, "it needs --serve") == 0 ? "needs_serve" : "refused";
+            std::printf("CAP batch_slots=%d batch_rows_max=%d batch_mtp=%d mtp_spec=%d layer_split=%d mtp_why=%s\n",
+                        o.batch, (int) strata::kernels::kVerifyMaxT, batch_mtp ? 1 : 0, o.spec,
+                        n_stages > 1 ? 1 : 0, cap_why);
+            std::fflush(stdout);
+        }
         std::string line;
         int64_t rounds = 0;
         const int S = o.spec;
@@ -10392,6 +10490,39 @@ int main(int argc, char** argv) {
             if (!adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
+            }
+            // fork(ADR-0005 D4): PROT <conv-token> <0|1> -> POK. Sets/clears the protect flag of the entries parked
+            // under that token (ConversationCache::set_prot) and the inheritance for its next parks (fork_prot, read
+            // at the park stamp, :7688-7690). An unknown token still answers POK: protection is inherited WHEN THE
+            // CONVERSATION PARKS - the runtime-mark shape pinned documents (conversation_cache.hpp:29-32,
+            // "a request that pins the same prefix again sets it"; pin= itself parsed per request at :9679-9704).
+            // Tokens are the GEN-line conv= keys (:9701), bounded [A-Za-z0-9._:-]{1,128} (server.py:983) -
+            // space-free, so the command is one space-separated line like every other verb. Additive: server.py
+            // never sends PROT; before this patch any such line fell through to the ERR at :9658-9661.
+            if (line.rfind("PROT ", 0) == 0) {
+                const size_t sp = line.find(' ', 5);
+                const std::string tok = sp == std::string::npos ? line.substr(5) : line.substr(5, sp - 5);
+                const bool on = sp == std::string::npos ? false : std::atoi(line.c_str() + sp + 1) != 0;
+                if (!tok.empty()) { fork_prot[tok] = on; conversations.set_prot(tok, on); }
+                std::printf("POK\n");
+                std::fflush(stdout);
+                continue;
+            }
+            // fork(ADR-0005 D7): STATS -> one STATS line. The counters exist in this process and are surfaced only
+            // in stderr today: cache_hits/multi_misses/pcie_experts are drive.d members (Drive :1040, instance
+            // :5304; stderr reports :9205/:10844), evictions is ConversationCache::evictions() incremented in
+            // the eviction loop (conversation_cache.hpp:345). seqs_active = the claimed-active batch slots
+            // (BSlot::active, :8970; the batch_on scan at :9001 is the same predicate). Wired from the variables,
+            // nothing recomputed. Reply shape follows the VRAM command's key=value answer (:8961); no fields join
+            // DONE (server.py's _parse_done grammar is untouched). Additive: server.py never sends STATS.
+            if (line.rfind("STATS", 0) == 0) {
+                size_t act = 0;
+                for (const BSlot& b : bs) if (b.active) ++act;
+                std::printf("STATS cache_hits=%lld multi_misses=%lld pcie_experts=%lld evictions=%zu seqs_active=%zu\n",
+                            (long long) drive.d.cache_hits, (long long) drive.d.multi_misses,
+                            (long long) drive.d.pcie_experts, conversations.evictions(), act);
+                std::fflush(stdout);
+                continue;
             }
             admit_slot = -1;
             if (line.rfind("BGEN ", 0) == 0 || line.rfind("BGENI ", 0) == 0) {
@@ -11220,6 +11351,11 @@ int main(int argc, char** argv) {
                 if (!restored_from_disk && req_conv != live_conv) disk_unchanged = 0;
                 live_conv = req_conv;
             }
+            // fork(ADR-0005 D4): the RAM cache's owner token for the park surface. Moved AFTER this iteration's
+            // park (park_current at :10004 ran against the OUTGOING owner, so the parked entry carries the token of
+            // the conversation that produced it); a keyless request makes the session keyless, matching :7487's
+            // RAM-park gate. Never touches live_conv's disk gating (:10154).
+            fork_conv_owner = req_conv;
             if (want_cvec != cvec_cached) {
                 live_ok = false;
                 checks.clear();
