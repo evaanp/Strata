@@ -100,6 +100,12 @@ public:
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
 
+    /// Catch-up only: the round over the window's accepted rows (cells p..p+a)
+    /// with NO draft chain and no proposals. A caller that paused drafting for
+    /// this window still owes the drafter's K/V the committed rows: without
+    /// this, its cells keep a hole and a later round reads stale state.
+    bool catch_up(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
+
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
