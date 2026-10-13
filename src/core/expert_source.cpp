@@ -3768,27 +3768,32 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
-        // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
-        // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
+        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a MISSED entry routed
+        // only at rank >= R (the smallest weights of the top-10) contributes zero, without renormalisation (the
+        // others keep the weight the router gave them).  Less PCIe and CPU work.  P14h: the decision is PER
+        // ENTRY, never per expert-window.  The old joint rule (skip an expert iff EVERY row of the window
+        // routes it weakly) made row 0's expert set depend on row 1's routing: row 0 of a T>1 window then
+        // differed from the T=1 chain by ~0.7 logit at the same position with the same committed prefix
+        // (evidence/2026-10-13-p14h-rmatrix).  An expert is fetched iff at least one of its entries survives.
         const int tail_rank = tail_skip_rank();
-        bool skip_d[kMaxWindowEntries];
-        for (int q = 0; q < nd; ++q) skip_d[q] = false;
+        bool skip_e[kMaxWindowEntries];       // per entry: this entry's contribution is zero
+        for (int64_t i = 0; i < n; ++i) skip_e[i] = false;
         if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
-            int minr[kMaxWindowEntries];
-            for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
-                int q = 0;
-                while (q < nd && distinct[q] != first_of[i]) ++q;
-                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
-            }
-            for (int q = 0; q < nd; ++q) {
-                const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                const int32_t e = ids[i];
+                if (e < 0 || e >= d.n_expert || (int) (i % k) < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
-                skip_d[q] = true;
-                --nmiss;
-                ++d.tail_experts;
+                skip_e[i] = true;
+            }
+            for (int q = 0; q < nd; ++q) {   // an expert whose every entry is skipped is not fetched at all
+                const int64_t i0 = distinct[q];
+                const int32_t e = ids[i0];
+                if (e < 0 || e >= d.n_expert) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // not a miss
+                bool any = false;
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0 && !skip_e[i]) { any = true; break; }
+                if (!any) { --nmiss; ++d.tail_experts; }
             }
         }
         const bool pcie_ok = d.pcie_num > 0 && d.src->pcie_layer(d.layers);
@@ -3807,7 +3812,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
-            if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
+            bool all_skip = true;                  // STRATA_ROUTE_TAIL_SKIP: every entry zero -> neither copied nor computed
+            for (int64_t i = i0; i < n; ++i)
+                if (first_of[i] == i0 && !skip_e[i]) { all_skip = false; break; }
+            if (all_skip) {
                 for (int64_t i = i0; i < n; ++i)
                     if (first_of[i] == i0) kind[i] = -2;
                 continue;
@@ -3839,12 +3847,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+                if (first_of[i] == i0) kind[i] = skip_e[i] ? -2 : kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
+                if (first_of[i] == i0 && !skip_e[i]) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;
@@ -3859,7 +3867,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
+                if (first_of[i] == i0 && !skip_e[i]) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;

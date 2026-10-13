@@ -1593,6 +1593,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
+        // P14h (measurement, env-gated): row 0's residual stream 0 at the start of each layer (the previous
+        // layer's pending write was applied by its pre's read).  Comparing a T=1 step against a T>1 window at
+        // the same position names the first layer where the multi-row forward departs from the single-row one.
+        static const bool dump_resid = std::getenv("STRATA_DUMP_ROW0_RESID") != nullptr;
+        if (dump_resid && grp == 0 && tb == 0) {
+            static std::vector<float> rbuf;
+            if (rbuf.empty()) rbuf.resize((size_t) N);
+            if (cudaMemcpy(rbuf.data(), Rt(0), (size_t) N * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                double nrm = 0.0;
+                for (int64_t i = 0; i < N; ++i) nrm += (double) rbuf[(size_t) i] * (double) rbuf[(size_t) i];
+                std::fprintf(stderr, "strata: resid l=%lld norm=%.9g v0=%.9g v1=%.9g\n", (long long) l,
+                             std::sqrt(nrm), (double) rbuf[0], (double) rbuf[1]);
+            }
+        }
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
