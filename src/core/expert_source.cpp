@@ -3223,6 +3223,30 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
+int64_t FileExpertSource::lock_mapped_expert(int64_t layer, int64_t expert, bool lock, bool prev_locked,
+                                             bool next_locked) {
+#if defined(_WIN32)
+    (void) layer; (void) expert; (void) lock; (void) prev_locked; (void) next_locked;
+    return -1;
+#else
+    if (role_ptr_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return -1;
+    const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const auto down = [pg](uintptr_t x) { return x & ~(pg - 1); };
+    const auto up = [pg](uintptr_t x) { return (x + pg - 1) & ~(pg - 1); };
+    int64_t bytes = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        const uintptr_t p = (uintptr_t) (role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]));
+        const uintptr_t end = p + (uintptr_t) role_bytes_[i];
+        const uintptr_t a = lock || !prev_locked ? down(p) : up(p);
+        const uintptr_t b = lock || !next_locked ? up(end) : down(end);
+        if (b > a && (lock ? ::mlock((void*) a, b - a) : ::munlock((void*) a, b - a)) != 0) return -1;
+        bytes += (int64_t) role_bytes_[i];
+    }
+    return bytes;
+#endif
+}
+
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     err.clear();
     if (n <= xstage_cap_) return true;

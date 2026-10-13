@@ -120,6 +120,53 @@ bool WeightTable::pool_bytes(const std::string& pack_dir, uint64_t& out, std::st
     return true;
 }
 
+bool WeightTable::layer_bytes(const std::string& pack_dir, int64_t n_layers, std::vector<uint64_t>& per_layer,
+                              uint64_t& globals, uint64_t& keep_bytes, std::string& err,
+                              const std::set<std::string>* skip, const std::set<std::string>* keep) {
+    const std::string path = pack_dir + "/index.txt";
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) { err = "cannot open " + path; return false; }
+    if (n_layers < 0) { err = "layer_bytes: a negative layer count"; std::fclose(f); return false; }
+    per_layer.assign((size_t) n_layers, 0);
+    globals = 0;
+    keep_bytes = 0;
+    int align = 0;
+    bool header = false;
+    char line[1024];
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#') {
+            unsigned long long p = 0;
+            int a = 0, t = 0;
+            if (std::sscanf(line, "# align %d pool %llu tensors %d", &a, &p, &t) == 3) { align = a; header = true; }
+            continue;
+        }
+        char name[256] = {0};
+        unsigned long long dst_bytes = 0, dummy = 0;
+        int i1 = 0, i2 = 0;
+        if (std::sscanf(line, "%255s %d %d %llu %llu %llu %llu", name, &i1, &i2, &dummy, &dummy, &dummy, &dst_bytes) != 7)
+            continue;
+        if (skip != nullptr && skip->count(name)) continue;
+        const uint64_t a = align > 0 ? (uint64_t) align : 256;
+        const uint64_t placed = (dst_bytes + a - 1) / a * a;
+        const int64_t l = tensor_layer(name);
+        if (l < 0) {
+            globals += placed;   // every stage holds it
+        } else if (keep != nullptr && keep->count(name) != 0) {
+            keep_bytes += placed;   // resident on EVERY stage, whatever range it runs
+        } else if (l >= n_layers) {
+            err = std::string(name) + ": layer " + std::to_string(l) + " is beyond the model's " +
+                  std::to_string(n_layers) + " layers";
+            std::fclose(f);
+            return false;
+        } else {
+            per_layer[(size_t) l] += placed;
+        }
+    }
+    std::fclose(f);
+    if (!header) { err = "no '# align ... pool ...' header in " + path; return false; }
+    return true;
+}
+
 bool WeightTable::index_code_bits(const std::string& pack_dir, const std::string& name, int& code_bits,
                                   std::string& err) {
     const std::string path = pack_dir + "/index.txt";

@@ -27,6 +27,11 @@ public:
     /// supported type, 2-D), read from the GGUF headers only - so the canonical arena can skip them.
     static bool served_names(const std::vector<std::string>& shards, bool include_ple_key,
                              std::set<std::string>& out, std::string& err);
+    /// What each layer's native projections cost, from the GGUF headers only - the split search's price
+    /// model, the counterpart of `WeightTable::layer_bytes`, and the same eligibility `load` applies.
+    /// `per_layer` comes back sized to `n_layers`; summing a range equals what `load` allocates for it.
+    static bool served_layer_bytes(const std::vector<std::string>& shards, bool include_ple_key, int64_t n_layers,
+                                   std::vector<uint64_t>& per_layer, std::string& err);
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);

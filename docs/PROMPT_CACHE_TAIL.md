@@ -2,8 +2,10 @@
 
 `--prompt-cache-tail` saves at most one extra mid-prompt checkpoint near the end
 of a request, at a boundary the batched prefill already reaches. It is off by
-default and applies to single-GPU serve with positive `--prompt-cache` and
-`--prompt-cache-every` values.
+default and needs positive `--prompt-cache` and `--prompt-cache-every` values.
+Under a layer split the near-tail checkpoint is saved from the stage parts at
+the same chunk boundary; an incomplete set of parts means no tail checkpoint
+for that request.
 
 A branch can share most of a prompt but diverge before its final cached state.
 If the periodic checkpoint before that branch is far away, the engine has to
@@ -18,7 +20,9 @@ The option does not split prefill chunks or alter the periodic checkpoint
 schedule. It selects the first completed batched chunk within one configured
 chunk of the prompt's end, excluding the short final suffix controlled by
 `--short-read`. If a periodic checkpoint already falls there, the same state is
-saved once. Reread diagnostics and layer splits keep their existing behavior.
+saved once. Reread diagnostics keep their existing behavior; under a split each
+stage takes its part at the tail boundary on its own chunk, exactly as the
+periodic checkpoints already do.
 
 For example, with a 6144-token chunk and a 16384-token checkpoint interval,
 the first periodic checkpoint is at 18432 and the next would be at 36864.
