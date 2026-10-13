@@ -314,6 +314,16 @@ public:
     /// STRATA_VERIFY_PROFILE=1 - GPU stage times of the windows since the last call (ms per
     /// window), as one line; empty when off.
     std::string profile_report();
+    /// P14j (StrataSharp sexec anatomy): copy the stage sums (ns) accumulated
+    /// since the last take - [GDN/QSA layers][column, see profile_report's
+    /// names] - into out and zero them, so the next take starts fresh;
+    /// *windows_out gets the windows those sums cover (also reset). Only
+    /// meaningful with STRATA_VERIFY_PROFILE on (the anatomy load param
+    /// turns it on). Columns no kernel stamped stay 0: a 0 column means
+    /// "not stamped", never "this phase took 0 ms" - the caller folds the
+    /// unattributed remainder into its own residual row.
+    static constexpr int kProfileColumns = 33;   // == kProfPer (asserted in verify.cpp)
+    void take_profile(double out[2][kProfileColumns], int64_t* windows_out);
 
 private:
     RemoteExpertOpt* remote_opt_ = nullptr;

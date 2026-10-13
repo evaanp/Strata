@@ -2185,6 +2185,13 @@ void Verifier::collect_profile() {
     accumulate_profile(prof_h_.data());
 }
 
+void Verifier::take_profile(double out[2][kProfileColumns], int64_t* windows_out) {
+    static_assert(kProfileColumns == kProfPer, "profile column count must match kProfPer");
+    for (int k = 0; k < 2; ++k)
+        for (int i = 0; i < kProfPer; ++i) { out[k][i] = prof_sum_[k][i]; prof_sum_[k][i] = 0.0; }
+    if (windows_out != nullptr) { *windows_out = prof_windows_; prof_windows_ = 0; }
+}
+
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
