@@ -3830,6 +3830,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
+                } else if (d.staged != nullptr && d.staged(d.staged_ctx, d.layers, e, &ptr)) {
+                    kd = 0;                        // M3-S1: a predicted row staged in VRAM. The hook waited
+                                                   // for its copy before answering, so this is a GPU group like
+                                                   // a hit - the use is decided by prediction and routing, the
+                                                   // copy's lateness only costs the layer a measured wait.
                 } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
