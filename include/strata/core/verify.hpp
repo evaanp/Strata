@@ -259,6 +259,21 @@ public:
         return true;
     }
     double ms_gate = 0;   ///< host time spent holding a layer's plan for the adaptive copies (decode timing prints it)
+    /// P15: the events one window's own span is read from. A layer split's
+    /// stages each bracket their own window (before this, stage 0's device span
+    /// ran to the end of the whole chain, because its event was recorded after
+    /// `next_->run` returned). `pre` is recorded just before the launch, `done`
+    /// right after it - on the same stream, so it fires when the graph
+    /// completes - and `post` after the window's stream sync, so `done..post`
+    /// is the sync's own wall. Null: no events (the caller does not measure).
+    /// Set before the first `run`; the pipelined path records its own.
+    void set_span_events(cudaEvent_t pre, cudaEvent_t done, cudaEvent_t post) {
+        span_pre_ = pre; span_done_ = done; span_post_ = post;
+    }
+    /// Host wall of this verifier's graph enqueue, cumulative (ms): the host's
+    /// cudaGraphLaunch sits inside the window span and is separable from it only
+    /// on the host clock (the stream events cannot see it).
+    double ms_launch = 0;
     cudaStream_t stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -378,6 +393,7 @@ private:
     AdaptGate* adapt_gate_ = nullptr;     ///< 0.1.43: STRATA_ADAPT_OVERLAP's gate (null: off)
     void pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2]);
     cudaEvent_t ev_done_ = nullptr, ev_commit_ = nullptr;
+    cudaEvent_t span_pre_ = nullptr, span_done_ = nullptr, span_post_ = nullptr;   // P15: the window's own span
     unsigned long long* prof_pin_ = nullptr;   ///< pinned host copy of the stamps (pipelined windows)
     bool fl_active_ = false, fl_prof_ = false, fl_ple_ = false, commit_live_ = false, pl_prestaged_ = false;
     int fl_T_ = 0;
