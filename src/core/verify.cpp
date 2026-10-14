@@ -3644,7 +3644,19 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
         cudaError_t q;
-        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) _mm_pause();
+        /* The wait is bounded and REPORTED: an unbounded pause-spin here holds the
+         * host inside a commit, so whatever the previous commit waits on (a window
+         * graph whose doorbells only this host raises) can never be served - and the
+         * box showed exactly that shape: an item at 100% CPU for minutes with
+         * nothing in the log. 20 s is the window watchdogs' own ceiling (#267). */
+        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) {
+            _mm_pause();
+            if (ms_since(t0) > 20000.0) {
+                err = "verify: the previous pipelined commit never finished (20 s): the host would hold its "
+                      "own doorbells";
+                return false;
+            }
+        }
         if (q != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(q); return false; }
     }
     h_commit_[0] = n_keep;
