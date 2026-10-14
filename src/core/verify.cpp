@@ -2253,6 +2253,16 @@ bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     return true;
 }
 
+// P15 delta 2: a window-span event is a MEASUREMENT; its record must never
+// leave a driver error latched (the fork's next check() would then blame an
+// innocent launch - the p15b box reported "copy_i32_from_mapped launch: invalid
+// resource handle" and "kv_stream: reset: invalid resource handle" this way,
+// both a cudaEventElapsedTime on a timing-disabled event that surfaced far from
+// its cause). A refused record leaves the span unmeasured, never poisoned.
+static void span_record(cudaEvent_t ev, cudaStream_t s) {
+    if (ev != nullptr && cudaEventRecord(ev, s) != cudaSuccess) (void) cudaGetLastError();
+}
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
 #if defined(STRATA_GPU_METAL)
@@ -2301,8 +2311,10 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return value != nullptr && value[0] == '1';
     }();
     // P15: this window's own span - recorded on this stage's stream, so a layer
-    // split's earlier stage ends here and not at the chain's end.
-    if (span_pre_ != nullptr) (void) cudaEventRecord(span_pre_, cs_);
+    // split's earlier stage ends here and not at the chain's end. P15 delta 2:
+    // the record is guarded (span_record) - a measurement must never latch a
+    // driver error for the fork's next check() to blame elsewhere.
+    span_record(span_pre_, cs_);
     const Clock::time_point t_launch = Clock::now();
     HostGraphLaunch launch(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
                            [this] { (void) release_gpu_waits(5000); });
@@ -2311,7 +2323,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
 #endif
     ms_launch += ms_since(t_launch);   // P15: the enqueue's host wall (inside the span)
-    if (span_done_ != nullptr) (void) cudaEventRecord(span_done_, cs_);   // fires when the graph completes
+    span_record(span_done_, cs_);       // fires when the graph completes
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -2445,7 +2457,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (span_post_ != nullptr) (void) cudaEventRecord(span_post_, cs_);   // P15: the sync's own wall ends here
+    span_record(span_post_, cs_);   // P15: the sync's own wall ends here
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
