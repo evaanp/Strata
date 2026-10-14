@@ -73,6 +73,10 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     return align_up(n, SESSION_STATE_ALIGN) + 4096;
 }
 
+size_t gdn_snapshot_bytes(const ModelGeometry& g, const SessionState& s) {
+    return (size_t) s.gdn_alloc * (size_t) gdn_state_floats(g) * sizeof(float);
+}
+
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo, int64_t layer_hi) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
