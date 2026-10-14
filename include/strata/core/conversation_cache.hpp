@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,8 +30,11 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
-    // Ordinary layer-split checkpoints retain each device's running state.
-    // Whole-session parking is currently single-GPU and rejects these parts.
+    // The carve this payload was saved from. A part can only restore into the stage that owns it:
+    // equal payload sizes alone cannot tell two same-sized carves with different ordinals apart.
+    int64_t layer_lo = 0, layer_hi = 0;
+    // Ordinary layer-split checkpoints retain each device's running state: this checkpoint is stage 0's
+    // part, and `stage_parts` holds one part per later stage in stage order. Parking keeps them too.
     std::vector<ConversationCheckpoint> stage_parts;
 
     size_t bytes() const {
@@ -148,14 +152,25 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 struct SavedConversation {
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
-    // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
+    // Stage 0's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
     int64_t layer_lo = 0, layer_hi = 0;
     ConversationCheckpoint live;
     std::vector<ConversationCheckpoint> checkpoints;
-    std::vector<ConversationKv> kv; // main layers followed by the draft layer
+    std::vector<ConversationKv> kv; // flat in stage order: stage 0's layers, each later stage's, then the draft
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // A prefix entry (the keyless park): `live` is one checkpoint's payload with no chain behind it, and a
+    // RAM hit hands it back to the session's chain instead of adopting it as the session's live end.  Set by
+    // conversation_prefix_save; a full snapshot (chain or no chain) leaves it false.
+    bool prefix = false;
+    // fork(ADR-0005 D4): the conv= token this session's park ran under (the GEN-line key, generate.cpp:9701;
+    // server.py:983 bounds it to 128 space-free chars), and a per-entry protect flag set by the PROT command.
+    // `prot` is distinct from `pinned` (:29-32, the request-key prefix-pin mark) and from make_room's per-park-call
+    // `protect` count (:277-279); like pinned it is a runtime mark, never written to a session file. `conv` is
+    // identity only and is NOT counted by bytes(): a bounded label, like `geometry` above.
+    std::string conv;
+    bool prot = false;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
@@ -239,14 +254,16 @@ public:
     template<class Token>
     Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
         Match best;
-        // Ties prefer the most recently parked branch. The caller prefers its
+        // Ties prefer the most recently parked branch; at equal length a live-end match beats a checkpoint
+        // inside another entry - mounting the prefix entry is the smaller restore and leaves the longer
+        // snapshot parked for the conversation that continues its own tail.  The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
             if (e.cvec != cvec) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
-                if (n > best.tokens) best = {i, n, live};
+                if (n > best.tokens || (n == best.tokens && n > 0 && live && !best.live)) best = {i, n, live};
             };
             consider(e.live, true);
             for (const auto& c : e.checkpoints) consider(c, false);
@@ -263,15 +280,54 @@ public:
 
     // Reserve before allocating a snapshot. held is an incoming image removed
     // with take() but still alive during the exchange; count it against RAM too.
-    bool make_room(size_t incoming, size_t held = 0) {
-        if (!enabled() || held > budget_ || incoming > budget_ - held) return false;
+    // protect pins the newest `protect` entries - parked by the same parking call - against eviction: if
+    // they are all that is left and the room is still missing, refuse instead of evicting them, so a full
+    // snapshot that does not fit cannot cost the box the prefix entry parked moments before.
+    // fork(ADR-0005 D5): `room` optionally reports the park-time eviction identity and refusal cause (the park
+    // site turns this into PKINFO/PKREFUSE on stdout, generate.cpp park_view). victims = the conv tokens of the
+    // entries this evicted (capped at 8; an empty token = a victim parked without a conv= key); refuse = why it
+    // said no: 0 none | 1 byte_budget (the header bound below: budget_/held/incoming - the park site's "exceeds
+    // available budget", generate.cpp:7598) | 2 protected_only (nothing evictable: only pinned/protected entries
+    // remain - the evict_oldest() end-of-search or the final bound the protect-limited loop could not pass). The
+    // RAM-floor refusal is the caller's cause, never this function's (conversation_memory.hpp:14-17).
+    struct Room {
+        std::vector<std::string> victims;
+        int refuse = 0;
+    };
+    bool make_room(size_t incoming, size_t held = 0, size_t protect = 0, Room* room = nullptr) {
+        if (!enabled() || held > budget_ || incoming > budget_ - held) {
+            if (room) room->refuse = 1;   // fork(ADR-0005 D5): byte budget
+            return false;
+        }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
+        while (entries_.size() > protect && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!evict_oldest()) return false;
+            // fork(ADR-0005 D4/D5): victim selection is evict_oldest()'s body in 0.1.41; it now skips
+            // pinned AND protected entries and reports the victim's conv token through `room`.
+            if (!evict_oldest(room)) {
+                if (room) room->refuse = 2;   // fork(ADR-0005 D5): only pinned/protected entries left
+                return false;
+            }
+        }
+        if (!(entries_.size() < slots_ && bytes_ <= budget_ - held - incoming)) {
+            // fork(ADR-0005 D5): the loop stopped at the protect floor with the bound unmet - only protected (
+            // or pinned) entries stand between the budget and the room
+            if (room) room->refuse = 2;
+            return false;
         }
         return true;
+    }
+
+    // fork(ADR-0005 D4): set/clear the protect flag of every entry parked under conv token `conv` (empty matches
+    // nothing; returns found). The PROT command calls this for entries already resident; a conversation that
+    // parks later inherits the flag at park time (generate.cpp's park stamp) - the same runtime-only-mark shape as
+    // pinned, whose comment above (:29-32) says a request that pins the same prefix again sets it.
+    bool set_prot(const std::string& conv, bool v) {
+        if (conv.empty()) return false;
+        bool found = false;
+        for (auto& e : entries_) if (e.conv == conv) { e.prot = v; found = true; }
+        return found;
     }
 
     // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
@@ -279,10 +335,17 @@ public:
     // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
     // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
-    // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
-    bool evict_oldest() {
-        auto victim = std::find_if(entries_.begin(), entries_.end(), [](const SavedConversation& e) { return !e.pinned(); });
+    // False when none can go (empty, or only entries that hold a pinned shared prefix or carry the
+    // fork's protect flag are left).
+    // fork(ADR-0005 D4): protected entries (the PROT command) skip eviction alongside the pinned ones —
+    // PROT's guarantee covers make_room's budget loop AND 0.1.41's physical-RAM admission loop,
+    // which share this body. fork(ADR-0005 D5): `room` optionally records the victim's conv
+    // token (capped at 8; an empty token = a victim parked without a conv= key) for PKINFO's evicted= field.
+    bool evict_oldest(Room* room = nullptr) {
+        auto victim = std::find_if(entries_.begin(), entries_.end(),
+                                   [](const SavedConversation& e) { return !e.pinned() && !e.prot; });
         if (victim == entries_.end()) return false;
+        if (room && room->victims.size() < 8) room->victims.push_back(victim->conv);   // fork(ADR-0005 D5)
         bytes_ -= victim->bytes();
         entries_.erase(victim);
         ++evictions_;
@@ -336,11 +399,14 @@ public:
     }
     size_t superseded() const { return superseded_; }
 
-    bool put(SavedConversation&& image, size_t held = 0) {
+    bool put(SavedConversation&& image, size_t held = 0, Room* room = nullptr) {   // fork(ADR-0005 D5): room passthrough
         const size_t n = image.bytes();
-        if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
+        if (!enabled() || held > budget_ || n > budget_ - held) {   // make_room's refusal, first
+            if (room) room->refuse = 1;   // fork(ADR-0005 D5): byte budget
+            return false;
+        }
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
-        if (!make_room(n, held)) return false;
+        if (!make_room(n, held, 0, room)) return false;
         entries_.push_back(std::move(image));
         bytes_ += n;
         return true;
