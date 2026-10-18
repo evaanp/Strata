@@ -5543,14 +5543,27 @@ class MergingTokenizer(ByteTokenizer):
     """The byte tokenizer plus one merged token, "ab" = 300: enough to sample a split it would never produce."""
     AB = 300
 
-    def encode(self, text, parse_special=False):
-        out = []
-        for t in super().encode(text, parse_special):
-            if out and out[-1] == ord("a") and t == ord("b"):
-                out[-1] = self.AB
+    def _merge(self, out):
+        """The byte tokenizer's ids with every "a"+"b" pair merged (300), and the merged length after each id."""
+        merged, at = [], []
+        for t in out:
+            if merged and merged[-1] == ord("a") and t == ord("b"):
+                merged[-1] = self.AB
             else:
-                out.append(t)
-        return out
+                merged.append(t)
+            at.append(len(merged))
+        return merged, at
+
+    def encode(self, text, parse_special=False, plain=()):
+        return self.encode_marked(text, parse_special, plain)[0]
+
+    def encode_marked(self, text, parse_special=False, plain=()):
+        # #567 (0.1.45): the server's PromptEncoder drives encode_marked and re-encodes only past the last
+        # special shared with a recent prompt, so the merge must live here as well - an `encode` override
+        # alone is bypassed once the tokenizer has the resume-point API (and `max_special_len`).
+        ids, marks = super().encode_marked(text, parse_special, plain)
+        merged, at = self._merge(ids)
+        return merged, [(off, at[n - 1] if 0 < n <= len(at) else n) for off, n in marks]
 
     def token_bytes(self, t):
         if t == self.AB:
