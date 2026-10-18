@@ -11513,10 +11513,7 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        // `streamed_moved`: the shared KV pool carried the streamed layers' K/V (pool_move) - their authoritative
-        // pools hold nothing of this conversation any more, so they are not copied here
-        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, bool streamed_moved,
-                                    std::string& e) -> bool {
+        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
                 bool ok = true;
@@ -11539,12 +11536,10 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
-                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
-                    if (streamed_moved && from.qsa_states[from.qsa_ord0 + j].kv_mode == 1) continue;   // the pool carried it
+                for (int64_t j = 0; j < from.qsa_alloc; ++j)
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
                                                             to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
                         return failed();
-                }
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
@@ -11602,8 +11597,10 @@ int main(int argc, char** argv) {
                 if (!pool_reserve(*bslot_ss[0][(size_t) b], upto + 8, b)) { e = "the KV pool is full"; return false; }
                 kv_pool.shrink(*bslot_ss[0][(size_t) b], upto + 8);
             }
-            if (slot_copy_direct) {
-                if (!direct_slot_copy(true, b, ids, moved, e)) return false;
+            // (with --kv-pool-tokens the chunk-aware host path below is the one that must run: a direct
+            // device-to-device copy cannot respect the pool's chunk tables, so STRATA_SLOT_COPY_DIRECT stays off)
+            if (slot_copy_direct && !kv_pool.active()) {
+                if (!direct_slot_copy(true, b, ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
@@ -11652,8 +11649,8 @@ int main(int argc, char** argv) {
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             const bool moved = kv_pool.active();
             if (moved && !pool_move(b, -1, upto, e)) return false;
-            if (slot_copy_direct && at == nullptr) {
-                if (!direct_slot_copy(false, b, bs[(size_t) b].ids, moved, e)) return false;
+            if (slot_copy_direct && at == nullptr && !moved) {
+                if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
