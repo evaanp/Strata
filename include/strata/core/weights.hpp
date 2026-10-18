@@ -110,6 +110,24 @@ struct LoadReport {
     double upload_ms = 0.0;
 };
 
+/// The layer ordinal of a per-layer tensor name (`blk.<n>.<suffix>`), or -1 for a model-global name
+/// (`token_embd`, `output`, `output_hc_*`) or anything that is not a per-layer name at all.
+///
+/// ONE PARSER.  The split search's price model and NativeDense both have to answer "which layer is this",
+/// and two answers to that question is a stage quietly priced with another stage's layers - which is not a
+/// crash, it is a wrong number.  This function only needs the `blk.<n>.` prefix, which is the whole of what
+/// a range price cares about.
+inline int64_t tensor_layer(const std::string& name) {
+    if (name.size() < 6 || name.compare(0, 4, "blk.") != 0) return -1;
+    int64_t v = 0;
+    size_t i = 4;
+    for (; i < name.size() && name[i] >= '0' && name[i] <= '9'; ++i) {
+        v = v * 10 + (name[i] - '0');
+        if (v > 1000000) return -1;   // not a layer ordinal - refuse rather than overflow into one
+    }
+    return (i > 4 && i < name.size() && name[i] == '.') ? v : -1;
+}
+
 class WeightTable {
 public:
     /// The arena size the index asks for, readable WITHOUT loading anything - so a caller can size its
@@ -118,6 +136,20 @@ public:
     /// With `skip`, the size of the compacted arena that holds every tensor EXCEPT the named ones.
     static bool pool_bytes(const std::string& pack_dir, uint64_t& out, std::string& err,
                            const std::set<std::string>* skip = nullptr);
+
+    /// What one stage's arena costs for a layer range, priced WITHOUT loading anything: per-layer and
+    /// model-global byte totals, aligned exactly as `load` places them.  Pure arithmetic, which is what
+    /// lets the split search price a candidate placement before committing VRAM to it - the same reason
+    /// `session_bytes` is pure (see the session carve).
+    ///
+    /// `per_layer` comes back sized to `n_layers`; `keep_bytes` totals the names in `keep`, which every
+    /// stage holds whatever its range.  For any range, `globals + keep_bytes + sum(per_layer[lo,hi))`
+    /// equals `pool_bytes(..., skip)` for the matching skip set - the per-row alignment is order-independent,
+    /// so summing a range agrees with the loader's own compaction exactly.
+    static bool layer_bytes(const std::string& pack_dir, int64_t n_layers, std::vector<uint64_t>& per_layer,
+                            uint64_t& globals, uint64_t& keep_bytes, std::string& err,
+                            const std::set<std::string>* skip = nullptr,
+                            const std::set<std::string>* keep = nullptr);
 
     /// The `code_bits` field of one row of `<pack_dir>/index.txt`, readable WITHOUT loading anything (0 = the
     /// pack stores the tensor unquantized, e.g. a --compat-bf16 key; -1 = no such row).  #326: the loader has

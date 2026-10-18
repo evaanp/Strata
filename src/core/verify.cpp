@@ -1026,7 +1026,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
     if (!batch_rec_) groups_[T] = G;
-    // Programmatic dependent launch (pdl.hpp; sm_90+, opt-in: STRATA_DF_PDL=1): the window's quantizations and dense
+    // Programmatic dependent launch (pdl.hpp; sm_90+, STRATA_DF_PDL=0: off): the window's quantizations and dense
     // projections may start while the kernel before them finishes, loading their weights before they wait for its
     // output.  Only a launch whose predecessors in the graph are all kernels gets programmatic edges; every value is
     // the same as without them.
@@ -1173,13 +1173,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     return false;
                 }
             }
-            // STRATA_DF_PLE (opt-in: STRATA_DF_PLE=1): the window's post-projection steps in one pass, bitwise the per-token loop
+            // STRATA_DF_PLE (default on): the window's post-projection steps in one pass, bitwise the per-token loop
             // below (the norms divide at run time as its norms do; the history advances token by token), which also
             // writes the commit's history snapshots.  Scratch: layer 0's expert rows, combined by now, and the
             // hyper-connection read's `lo_`, which the read below rewrites.
             static const bool ple_post_env = [] {
                 const char* e = std::getenv("STRATA_DF_PLE");
-                return e != nullptr && std::atoi(e) != 0;
+                return !e || std::atoi(e) != 0;
             }();
             const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)

@@ -23,8 +23,8 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
-                          PP_DONE_TAIL, Service,
-                          StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
+                          PP_DONE_TAIL, Service, StrataEngine, Vision, api_key_of, engine_args, key_matches,
+                          layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_stats, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
@@ -584,6 +584,141 @@ class ListenProblem(unittest.TestCase):
 def shutil_rmtree(path):
     import shutil
     shutil.rmtree(path, ignore_errors=True)
+
+
+class VisionFootprint(unittest.TestCase):
+    """The Monitor's vision row. `strata-vision` reports no memory of its own - not to stdout, not to the log -
+    so the server measures what the card's free VRAM lost while it started. A wrong number is worse than none,
+    so only a plausible delta is kept (serve/server.py, Vision._start)."""
+
+    class FakeProc:
+        def __init__(self, *a, **k):
+            import io
+            self.stdout = io.StringIO("READY 1152\n")
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            pass
+
+    def setUp(self):
+        import serve.server as S
+        self.S = S
+        self.saved = (S._free_vram_mib, S.subprocess.Popen, S.contain)
+        S.subprocess.Popen, S.contain = self.FakeProc, lambda p: None
+        self.addCleanup(self._restore)                   # the patch outlives a restart() inside the test
+
+    def _restore(self):
+        self.S._free_vram_mib, self.S.subprocess.Popen, self.S.contain = self.saved
+
+    def start_vision(self, readings, **kw):
+        """A Vision started against scripted free-VRAM readings, with no process behind it."""
+        seq = iter(readings)
+        self.S._free_vram_mib = lambda index: next(seq)
+        return Vision({"exe": "x", "mmproj": "m", "model": "d", "gpu": True}, device=2, **kw)
+
+    def test_the_delta_is_what_the_card_lost(self):
+        v = self.start_vision([5000, 3579])                  # before, after
+        self.assertEqual(v.device, 2)                        # the card it was told about, not the engine's
+        self.assertEqual(v.mib, 1421)
+
+    def test_an_implausible_delta_is_not_reported(self):
+        for name, readings in (("nothing was taken", [5000, 5000]),
+                               ("the card gained memory", [5000, 6000]),
+                               ("more than any card", [20000, 5000]),
+                               ("too small to be an encoder", [5000, 4990]),
+                               ("NVML gave nothing", [None, 5000])):
+            with self.subTest(name):
+                self.assertIsNone(self.start_vision(readings).mib)
+
+    def test_a_bad_restart_keeps_the_last_good_reading(self):
+        # the old process's VRAM is not released the instant it is killed, so a restart can read a delta of ~0
+        v = self.start_vision([5000, 3579, 4000, 4000])
+        self.assertEqual(v.mib, 1421)
+        v.restart()
+        self.assertEqual(v.mib, 1421)
+
+
+class VisionMetrics(unittest.TestCase):
+    """What /metrics tells the Monitor about the encoder (the vision row on the per-GPU cards)."""
+
+    def svc_with(self, vision):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "ok", max_context=CTX), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        svc.vision = vision
+        return svc
+
+    def test_no_encoder(self):
+        self.assertEqual(self.svc_with(None).vision_metrics(),
+                         {"enabled": False, "running": False, "device": None, "mib": None})
+
+    def test_a_double_without_alive_still_reports(self):
+        # the image tests' Vision doubles have only `encode`; /metrics must not require more than a test needs
+        class Bare:
+            pass
+
+        self.assertEqual(self.svc_with(Bare()).vision_metrics(),
+                         {"enabled": True, "running": True, "device": None, "mib": None})
+
+    def test_a_stopped_encoder_holds_nothing(self):
+        class Stopped:
+            device, mib = 0, 1421
+
+            def alive(self):
+                return False
+
+        m = self.svc_with(Stopped()).vision_metrics()
+        self.assertFalse(m["running"])
+        self.assertIsNone(m["mib"])                          # it gave the VRAM back; the row goes with it
+
+    def test_a_running_encoder_reports_its_card_and_size(self):
+        class Running:
+            device, mib = 0, 1421
+
+            def alive(self):
+                return True
+
+        self.assertEqual(self.svc_with(Running()).vision_metrics(),
+                         {"enabled": True, "running": True, "device": 0, "mib": 1421})
+
+
+class GpuDraftField(unittest.TestCase):
+    """`gpu_draft_mib` is the seventh per-GPU list on the INFO line. The parser splits that line on whitespace
+    (serve/server.py), so a CSV field only survives as a single token - and a value like "-" must not be read as
+    a number."""
+
+    class FakeProc:
+        def __init__(self, lines):
+            import io
+            self.stdout = iter(lines)
+            self.stdin = io.StringIO()
+
+        def poll(self):
+            return None
+
+    def engine_with(self, info_line):
+        import serve.server as S
+        saved = S.subprocess.Popen, S.contain
+        S.subprocess.Popen = lambda *a, **k: self.FakeProc([info_line, "READY 4096 stop\n"])
+        S.contain = lambda p: None
+        self.addCleanup(lambda: (setattr(S.subprocess, "Popen", saved[0]), setattr(S, "contain", saved[1])))
+        return StrataEngine("engine/strata", ["--native", "x"])
+
+    def test_the_lists_survive_as_single_tokens(self):
+        eng = self.engine_with("INFO context=262144 gpu_dev=0,1,2,3 gpu_layers=0-29,30-47,-,- "
+                               "gpu_draft_mib=-,835,-,- spec=2 engine=0.1.39\n")
+        self.assertEqual(eng.info["gpu_dev"], "0,1,2,3")
+        self.assertEqual(eng.info["gpu_draft_mib"], "-,835,-,-")
+        self.assertEqual(eng.info["gpu_layers"], "0-29,30-47,-,-")
+        self.assertEqual(eng.info["context"], 262144)        # a plain number is still an int
+        self.assertEqual(eng.info["version"], "0.1.39")
+
+    def test_no_draft_head_stays_a_string(self):
+        # MTP off: every entry is "-", which must not become an int
+        eng = self.engine_with("INFO context=4096 gpu_dev=0 gpu_draft_mib=- engine=0.1.39\n")
+        self.assertEqual(eng.info["gpu_draft_mib"], "-")
+        self.assertEqual(eng.info["gpu_dev"], 0)             # one device: "0" is a number, as it always has been
 
 
 class ThinkTokenizer(ByteTokenizer):
@@ -3254,8 +3389,9 @@ class WebApp(unittest.TestCase):
         code, ctype, body = self.get("/metrics")
         self.assertEqual(code, 200)
         m = json.loads(body)
-        for key in ("engine", "live", "requests", "hardware", "hardware_static", "history"):
+        for key in ("engine", "live", "requests", "hardware", "hardware_static", "history", "vision"):
             self.assertIn(key, m)
+        self.assertEqual(m["vision"], {"enabled": False, "running": False, "device": None, "mib": None})
         self.assertEqual(m["engine"]["max_context"], CTX)
         self.assertEqual(m["live"]["state"], "idle")
         self.assertEqual(m["requests"][0]["output_tokens"], 5)
@@ -5403,7 +5539,148 @@ class ConnectionClose(unittest.TestCase):
 
     def test_a_streamed_answer_says_the_connection_closes(self):
         self.assertEqual(self.headers(stream=True).get("Connection"), "close")
+class MergingTokenizer(ByteTokenizer):
+    """The byte tokenizer plus one merged token, "ab" = 300: enough to sample a split it would never produce."""
+    AB = 300
 
+    def encode(self, text, parse_special=False):
+        out = []
+        for t in super().encode(text, parse_special):
+            if out and out[-1] == ord("a") and t == ord("b"):
+                out[-1] = self.AB
+            else:
+                out.append(t)
+        return out
+
+    def token_bytes(self, t):
+        if t == self.AB:
+            return b"ab"
+        return self.SPECIALS[t - 256].encode() if t >= 256 else bytes([t])
+
+    def decode(self, ids, errors="replace"):
+        return b"".join(self.token_bytes(t) for t in ids).decode("utf-8", errors=errors)
+
+
+class ContextCheckingEngine(MockEngine):
+    """Refuses prompt + max_new + CTX_SLACK > context, as `strata --serve` does (its ERR line is a ValueError)."""
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        if len(ids) + max_new + CTX_SLACK > self.max_context:
+            raise ValueError(f"prompt ({len(ids)} tokens) + max_new ({max_new}) exceeds the context ({self.max_context})")
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class SampledIds(unittest.TestCase):
+    """A split the model sampled ("a", "b") comes back as the tokenizer's merge ("ab"): the next prompt must carry
+    the sampled ids, or it stops continuing the engine's live end (a re-read of thousands of tokens on strata)."""
+
+    def setUp(self):
+        self.tok = MergingTokenizer()
+        sampled = self.tok.encode("\n</think>\n\n", parse_special=True) + [ord("a"), ord("b")] + \
+            self.tok.encode("<|im_end|>", parse_special=True)
+        self.engine = ContextCheckingEngine(self.tok, "unused", max_context=CTX)
+        self.engine.scripts = [sampled]
+        self.engine.script = sampled
+        self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.httpd = serve(self.svc, port=0)
+        self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
+
+    def tearDown(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+    def post(self, path, body, conversation="c1"):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json", "X-Strata-Conversation": conversation})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+
+    def two_turns(self, second_conversation="c1", answer="ab"):
+        first = [{"role": "user", "content": "hi"}]
+        self.post("/v1/chat/completions", {"model": "m", "messages": first, "max_tokens": 50})
+        live = self.engine.last_prompt + self.engine.script
+        second = first + [{"role": "assistant", "content": answer}, {"role": "user", "content": "more"}]
+        self.post("/v1/chat/completions", {"model": "m", "messages": second, "max_tokens": 50}, second_conversation)
+        return live, self.engine.last_prompt
+
+    def test_the_next_prompt_carries_the_sampled_ids(self):
+        live, prompt = self.two_turns()
+        self.assertEqual(prompt[:len(live)], live)
+
+    def test_a_longer_spliced_prompt_still_fits_a_budget_that_fills_the_context(self):
+        # PLA asks for exactly the room left (context - prompt - slack); the splice puts back 2 sampled ids for the
+        # 1 the tokenizer merges, so the prompt the engine reads is one longer than the one the budget was cut for
+        first = [{"role": "user", "content": "hi"}]
+        self.post("/v1/chat/completions", {"model": "m", "messages": first, "max_tokens": 50})
+        second = first + [{"role": "assistant", "content": "ab"}, {"role": "user", "content": "more"}]
+        n = len(self.tok.encode(self.svc.template.render(second), parse_special=True))
+        body = self.post("/v1/chat/completions", {"model": "m", "messages": second, "max_tokens": CTX - n - CTX_SLACK})
+        self.assertEqual(body["choices"][0]["finish_reason"], "stop", body)
+
+    def test_another_conversation_keeps_the_tokenizers_ids(self):
+        live, prompt = self.two_turns(second_conversation="c2")
+        self.assertNotEqual(prompt[:len(live)], live)
+        self.assertIn(MergingTokenizer.AB, prompt)
+
+    def test_different_text_is_not_spliced(self):
+        live, prompt = self.two_turns(answer="ac")
+        rendered = self.tok.encode(self.svc.template.render(
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "ac"},
+             {"role": "user", "content": "more"}]), parse_special=True)
+        self.assertEqual(prompt, rendered)
+
+
+class TokenizerRoutes(unittest.TestCase):
+    """llama-server's /tokenize, /detokenize and /apply-template: the prompt and ids this server reads."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tok = MergingTokenizer()
+        cls.svc = Service(MockEngine(cls.tok, "ok", max_context=CTX), cls.tok,
+                          ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, path, body):
+        req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            with e:
+                return e.code, json.loads(e.read())
+
+    def test_tokenize_uses_the_servers_tokenizer(self):
+        self.assertEqual(self.post("/tokenize", {"content": "xab<|im_end|>"}),
+                         (200, {"tokens": [ord("x"), MergingTokenizer.AB, 257]}))
+
+    def test_tokenize_counts_a_lone_surrogate_instead_of_refusing(self):
+        # PLA's in-turn fold counts text in which an emoji was cut in half (one UTF-16 half survives); a 400 there
+        # made it fall back to a characters / 4 estimate exactly when the window fit mattered (2026-10-03)
+        status, body = self.post("/tokenize", {"content": "x\ud83dy"})
+        self.assertEqual((status, len(body["tokens"])), (200, 3))
+
+    def test_tokenize_with_pieces(self):
+        self.assertEqual(self.post("/tokenize", {"content": "ab", "with_pieces": True}),
+                         (200, {"tokens": [{"id": MergingTokenizer.AB, "piece": "ab"}]}))
+
+    def test_detokenize_round_trips(self):
+        self.assertEqual(self.post("/detokenize", {"tokens": [ord("x"), MergingTokenizer.AB]}), (200, {"content": "xab"}))
+
+    def test_detokenize_rejects_non_ids(self):
+        self.assertEqual(self.post("/detokenize", {"tokens": ["a"]})[0], 400)
+
+    def test_apply_template_is_the_prompt_chat_completions_reads(self):
+        messages = [{"role": "user", "content": "hi"}]
+        status, body = self.post("/apply-template", {"messages": messages})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["prompt"], self.svc.template.render(messages))
 
 class AnswerBeforeTheBody(unittest.TestCase):
     """An answer sent before the request body was read must still reach a client that sends the body after the headers
