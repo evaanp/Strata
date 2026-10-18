@@ -4497,8 +4497,7 @@ int main(int argc, char** argv) {
     const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 : 0;
     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? 96 : 0;   // ~3 MiB per GDN layer, twice, ~15 layers
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
-        return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
-                                        (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * sizeof(float);
+        return strata::core::gdn_snapshot_bytes(g, s0);   // one definition (session.cpp), the executor's copy rides it
     };
     const int64_t kHelperMinMib = 256;   // below this a spill tier costs more in PCIe round trips than it saves
     // #340: with the own prompt buffers chosen by the split's rule (not asked for with --no-prefill-borrow) the

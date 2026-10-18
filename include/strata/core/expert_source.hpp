@@ -441,6 +441,15 @@ struct ForesightSwap;
 
 struct ExpertDispatch {
     ForesightSwap* fs = nullptr;   ///< Foresight swap space (STRATA_FS_SLOTS; null = off)
+    /// M3-S1 (sexec ABI v15): deterministic predictive streaming. The executor stages
+    /// the experts the router lookahead predicted for this layer in a small per-device
+    /// VRAM arena; this answers whether `(layer, e)` has such a staged row and hands
+    /// back its device address. THE HOOK WAITS for the copy to land before returning
+    /// true - a predicted and routed entry is computed from staging whatever the copy
+    /// speed, so which experts the GPU computes stays a function of prediction and
+    /// actual routing only, never of copy timing (the §10a determinism rule).
+    bool (*staged)(void* ctx, int64_t layer, int32_t e, unsigned long long* ptr) = nullptr;
+    void* staged_ctx = nullptr;
     strata::kernels::cpu::ExpertPool* pool = nullptr;
     ExpertSource* src = nullptr;
     RouterLookahead* lookahead = nullptr;   ///< CS-T: warms the next layer's predicted file-tier experts

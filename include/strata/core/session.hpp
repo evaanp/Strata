@@ -97,6 +97,11 @@ struct SessionState {
 /// a candidate range before anything is allocated, which is how the layer-split search prices a placement.
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo = 0,
                        int64_t layer_hi = -1);
+/// The bytes of a session's GDN state - what the pipelined windows copy aside before a speculative commit
+/// (generate.cpp's PlSnap, verify.cpp's pl_commit_async replay).  Pure arithmetic on the carved rows and the
+/// geometry; the caller owns the copy.  P15: public because a second host (the sexec executor) drives the
+/// pipeline now, and a copied formula would drift.
+size_t gdn_snapshot_bytes(const ModelGeometry& g, const SessionState& s);
 /// Carves `base` (DEVICE memory) into `s`.  Returns the bytes used.  Same range convention as `session_bytes`.
 uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void* base, SessionState& s,
                       int64_t layer_lo = 0, int64_t layer_hi = -1);

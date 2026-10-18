@@ -1736,6 +1736,44 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     return true;
 }
 
+bool MtpDrafter::catch_up(int T, const int32_t* tokens, int64_t p, int a, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: catch_up arguments out of range"; return false; }
+    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    // #783 PR-i: the rejected rows' cells need no K/V - the next round writes them first.
+    if (!mtp_catchup_all()) T = a + 1;
+    const bool cp = coupled_active_;
+    if (!capture_round(T, cp, err)) return false;
+    const int64_t NH = g_->n_head;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put(t, p + t);
+    }
+    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // the round's draft-0 cell (overwritten next round)
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(T, err)) return false;
+    if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        err = std::string("mtp catch_up: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("mtp catch_up: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    ++rounds;
+    return true;
+}
+
 bool MtpDrafter::stage_source_R(int T, std::string& err) {
     if (src_R_ == nullptr || src_R_ == window_R_) return true;
     const Clock::time_point t_src = Clock::now();

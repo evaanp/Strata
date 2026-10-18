@@ -1943,6 +1943,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
+        // P14h (measurement, env-gated): row 0's residual stream 0 at the start of each layer (the previous
+        // layer's pending write was applied by its pre's read).  Comparing a T=1 step against a T>1 window at
+        // the same position names the first layer where the multi-row forward departs from the single-row one.
+        static const bool dump_resid = std::getenv("STRATA_DUMP_ROW0_RESID") != nullptr;
+        if (dump_resid && grp == 0 && tb == 0) {
+            static std::vector<float> rbuf;
+            if (rbuf.empty()) rbuf.resize((size_t) N);
+            if (cudaMemcpy(rbuf.data(), Rt(0), (size_t) N * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess) {
+                double nrm = 0.0;
+                for (int64_t i = 0; i < N; ++i) nrm += (double) rbuf[(size_t) i] * (double) rbuf[(size_t) i];
+                std::fprintf(stderr, "strata: resid l=%lld norm=%.9g v0=%.9g v1=%.9g\n", (long long) l,
+                             std::sqrt(nrm), (double) rbuf[0], (double) rbuf[1]);
+            }
+        }
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
@@ -2541,6 +2555,13 @@ void Verifier::collect_profile() {
     accumulate_profile(prof_h_.data());
 }
 
+void Verifier::take_profile(double out[2][kProfileColumns], int64_t* windows_out) {
+    static_assert(kProfileColumns == kProfPer, "profile column count must match kProfPer");
+    for (int k = 0; k < 2; ++k)
+        for (int i = 0; i < kProfPer; ++i) { out[k][i] = prof_sum_[k][i]; prof_sum_[k][i] = 0.0; }
+    if (windows_out != nullptr) { *windows_out = prof_windows_; prof_windows_ = 0; }
+}
+
 void Verifier::accumulate_profile(const unsigned long long* stamps) {
     const ModelGeometry& g = *g_;
     const int64_t L = g.n_layers;
@@ -2602,6 +2623,16 @@ bool Verifier::adapt_gate_wait(int32_t layer, std::string& err) {
     return true;
 }
 
+// P15 delta 2: a window-span event is a MEASUREMENT; its record must never
+// leave a driver error latched (the fork's next check() would then blame an
+// innocent launch - the p15b box reported "copy_i32_from_mapped launch: invalid
+// resource handle" and "kv_stream: reset: invalid resource handle" this way,
+// both a cudaEventElapsedTime on a timing-disabled event that surfaced far from
+// its cause). A refused record leaves the span unmeasured, never poisoned.
+static void span_record(cudaEvent_t ev, cudaStream_t s) {
+    if (ev != nullptr && cudaEventRecord(ev, s) != cudaSuccess) (void) cudaGetLastError();
+}
+
 bool Verifier::handoff_failed(std::string& err) const {
     if (herr_h_ == nullptr || *(const volatile uint32_t*) herr_h_ == 0) return false;
     err = "verify: layer split: the hand-off into layer " + std::to_string(lb_) + " did not arrive within " +
@@ -2634,7 +2665,13 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
+    // P15: a prelaunched window carries the same span as one this thread launches - span_pre_ opens it on this
+    // stage's own stream, span_done_ fires when its graph completes
+    span_record(span_pre_, cs_);
+    const Clock::time_point t_launch = Clock::now();
     const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
+    ms_launch += ms_since(t_launch);   // P15: the enqueue's host wall (inside the span)
+    span_record(span_done_, cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
@@ -2699,6 +2736,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
             !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
+        // P15: this window's own span - recorded on this stage's stream, so a layer
+        // split's earlier stage ends here and not at the chain's end. P15 delta 2:
+        // the record is guarded (span_record) - a measurement must never latch a
+        // driver error for the fork's next check() to blame elsewhere.
+        span_record(span_pre_, cs_);
+        const Clock::time_point t_launch = Clock::now();
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         // A blocking instrumented launch cannot also serve the graph's CPU doorbells.
         static const bool threaded_launch = [] {
@@ -2713,6 +2756,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+        ms_launch += ms_since(t_launch);   // P15: the enqueue's host wall (inside the span)
+        span_record(span_done_, cs_);       // fires when the graph completes
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         (void) launch_o->query();
 #else
@@ -2902,6 +2947,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
+    span_record(span_post_, cs_);   // P15: the sync's own wall ends here
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
@@ -4175,7 +4221,19 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
         cudaError_t q;
-        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) _mm_pause();
+        /* The wait is bounded and REPORTED: an unbounded pause-spin here holds the
+         * host inside a commit, so whatever the previous commit waits on (a window
+         * graph whose doorbells only this host raises) can never be served - and the
+         * box showed exactly that shape: an item at 100% CPU for minutes with
+         * nothing in the log. 20 s is the window watchdogs' own ceiling (#267). */
+        while ((q = cudaEventQuery(ev_commit_)) == cudaErrorNotReady) {
+            _mm_pause();
+            if (ms_since(t0) > 20000.0) {
+                err = "verify: the previous pipelined commit never finished (20 s): the host would hold its "
+                      "own doorbells";
+                return false;
+            }
+        }
         if (q != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(q); return false; }
     }
     h_commit_[0] = n_keep;
