@@ -675,12 +675,12 @@ class VisionFootprint(unittest.TestCase):
     def setUp(self):
         import serve.server as S
         self.S = S
-        self.saved = (S._free_vram_mib, S.subprocess.Popen, S.contain)
-        S.subprocess.Popen, S.contain = self.FakeProc, lambda p: None
+        self.saved = (S._free_vram_mib, S.subprocess.Popen)
+        S.subprocess.Popen = self.FakeProc
         self.addCleanup(self._restore)                   # the patch outlives a restart() inside the test
 
     def _restore(self):
-        self.S._free_vram_mib, self.S.subprocess.Popen, self.S.contain = self.saved
+        self.S._free_vram_mib, self.S.subprocess.Popen = self.saved
 
     def start_vision(self, readings, **kw):
         """A Vision started against scripted free-VRAM readings, with no process behind it."""
@@ -769,10 +769,9 @@ class GpuDraftField(unittest.TestCase):
 
     def engine_with(self, info_line):
         import serve.server as S
-        saved = S.subprocess.Popen, S.contain
+        saved = S.subprocess.Popen
         S.subprocess.Popen = lambda *a, **k: self.FakeProc([info_line, "READY 4096 stop\n"])
-        S.contain = lambda p: None
-        self.addCleanup(lambda: (setattr(S.subprocess, "Popen", saved[0]), setattr(S, "contain", saved[1])))
+        self.addCleanup(lambda: setattr(S.subprocess, "Popen", saved))
         return StrataEngine("engine/strata", ["--native", "x"])
 
     def test_the_lists_survive_as_single_tokens(self):

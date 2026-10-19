@@ -54,9 +54,10 @@ class DoneEngine(MockEngine):
             StrataEngine._parse_done(self, self.done_lines.pop(0))
 
 
-def start(engine_cls, **kw):
+def start(engine_cls, fit_max_tokens=True, **kw):
     tok = ByteTokenizer()
-    svc = Service(engine_cls(tok, "ok", max_context=CTX, **kw), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+    svc = Service(engine_cls(tok, "ok", max_context=CTX, **kw), tok, ChatTemplate(ROOT / "serve/chat_template.jinja"),
+                  fit_max_tokens=fit_max_tokens)
     httpd = serve(svc, port=0)
     return svc, httpd, f"http://127.0.0.1:{httpd.server_address[1]}"
 
@@ -93,7 +94,9 @@ class RefusedBeforeTheStream(unittest.TestCase):
     still a 400 (the server refuses that one itself, before the engine)."""
 
     def setUp(self):
-        self.svc, self.httpd, self.base = start(RefusingEngine)
+        # strict context mode (upstream 0.2.0 defaults to clamping max_tokens): the 400 is the
+        # pre-engine refusal this class is about, not a request the server would shorten.
+        self.svc, self.httpd, self.base = start(RefusingEngine, fit_max_tokens=False)
 
     def tearDown(self):
         self.httpd.shutdown()
