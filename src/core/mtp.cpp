@@ -349,6 +349,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     const bool kv_int8_was = qsa_kv_int8();
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
+    // a shared KV pool (--kv-pool-tokens) backs the sessions' layers only: a drafter streamed whole (no ring, the
+    // window covers the context) pins a host copy of its own
+    const bool shared_host_was = qsa_kv_shared_host();
+    qsa_set_kv_shared_host(false);
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
     if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
@@ -364,6 +368,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
+    qsa_set_kv_shared_host(shared_host_was);
     qsa_state_zero(st_, g, nullptr);
     cudaDeviceSynchronize();
     vram_ += sb;
@@ -1733,6 +1738,44 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     for (int j = n; j < max_t_ - 1; ++j) { drafts[j] = 0; if (probs) probs[j] = 0.0f; }
     if (n_drafts) *n_drafts = n;
     ms_draft += ms_since(t0);
+    ++rounds;
+    return true;
+}
+
+bool MtpDrafter::catch_up(int T, const int32_t* tokens, int64_t p, int a, std::string& err) {
+    const OnDevice on_device(device_);
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: catch_up arguments out of range"; return false; }
+    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    // #783 PR-i: the rejected rows' cells need no K/V - the next round writes them first.
+    if (!mtp_catchup_all()) T = a + 1;
+    const bool cp = coupled_active_;
+    if (!capture_round(T, cp, err)) return false;
+    const int64_t NH = g_->n_head;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int t = 0; t < T; ++t) {
+        h_tok_[t] = tokens[t];
+        put(t, p + t);
+    }
+    put(2 * max_t_ - 1, coupled_draft_cell(p, a, 0));   // the round's draft-0 cell (overwritten next round)
+    h_row_[0] = a;
+    h_row_[1] = 0;
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (!stage_source_R(T, err)) return false;
+    if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        err = std::string("mtp catch_up: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("mtp catch_up: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
     ++rounds;
     return true;
 }

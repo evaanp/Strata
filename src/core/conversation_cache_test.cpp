@@ -419,6 +419,67 @@ int main() {
         const auto past_pin = three.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6, 30, 99}, {}, true);
         check(past_pin.tokens == 7 && !three.borrows(past_pin),
               "a match past the pinned prefix (the copy would carry the pin) is taken, not borrowed");
+        {
+        // Keyless parking (prefix entries): the shareable root as `live`, no chain behind it.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 4);
+        check(cache.put(image({1, 2, 3, 4, 5})), "park A's prefix");
+        check(cache.put(image({1, 2, 3, 9})), "park B's prefix beside it");
+        const auto ma = cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6}, {}, true);
+        const auto mb = cache.best(std::vector<int64_t>{1, 2, 3, 9, 8}, {}, true);
+        check(ma.tokens == 5 && ma.live && ma.index == 0, "A's prompt hits A's prefix as live");
+        check(mb.tokens == 4 && mb.live && mb.index == 1, "B's prompt hits B's prefix, not A's");
+        SavedConversation keyed = image({1, 2, 3, 4, 50});
+        keyed.checkpoints = {cp({1, 2, 3, 4})};
+        check(cache.put(std::move(keyed)), "park a chain that holds A's root point");
+        check(cache.size() == 3 && cache.superseded() == 0, "a prefix entry is never superseded by a chain holding its point");
+        const auto longer = cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6}, {}, true);
+        check(longer.tokens == 5 && longer.live && longer.index == 0, "the prefix entry wins on length over the keyed checkpoint");
+        ConversationCache tight(1 << 20, 2);
+        tight.put(image({1, 2, 3, 4})); tight.put(image({1, 2, 3, 9}));
+        check(tight.best(std::vector<int64_t>{1, 2, 3, 9, 8}, {}, true).tokens == 4, "two prefixes coexist within the slots");
+        tight.put(image({1, 2, 3, 7}));
+        check(tight.evictions() == 1 && tight.best(std::vector<int64_t>{1, 2, 3, 4, 5}, {}, true).tokens == 0,
+              "a third prefix evicts the oldest");
+    }
+    {
+        // Hybrid keyless parking: the prefix entry and the full snapshot side by side.  A continuation of the
+        // conversation hits its live end; another job with the same system prompt hits the prefix entry - an
+        // equal-length checkpoint inside the snapshot must not steal the match, or a job that only needs the
+        // root consumes (and restores whole) the snapshot its owner continues from.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        ConversationCache cache(1 << 20, 4);
+        SavedConversation p = image({1, 2, 3, 4});
+        p.prefix = true;                                      // parked first: the shareable root
+        check(cache.put(std::move(p)), "park the prefix entry");
+        SavedConversation f = image({1, 2, 3, 4, 5, 6});
+        f.checkpoints = {cp({1, 2, 3, 4})};                   // the same conversation's live end and chain
+        check(cache.put(std::move(f)), "park the full snapshot beside it");
+        const auto cont = cache.best(std::vector<int64_t>{1, 2, 3, 4, 5, 6, 7}, {}, true);
+        check(cont.tokens == 6 && cont.live && cont.index == 1, "the continuation hits the full snapshot");
+        const auto other = cache.best(std::vector<int64_t>{1, 2, 3, 4, 9, 9}, {}, true);
+        check(other.tokens == 4 && other.live && other.index == 0,
+              "a different prompt with the same prefix hits the prefix entry, not the snapshot's checkpoint");
+    }
+    {
+        // The tight box: a byte budget that fits the prefix entry or the full snapshot, never both.  make_room
+        // refuses for the full snapshot instead of evicting the prefix entry parked by the same call - without
+        // the protection the hybrid would be worse than prefix-only parking on such a box.
+        auto cp = [](std::vector<int32_t> ids) { ConversationCheckpoint c; c.ids = std::move(ids); return c; };
+        SavedConversation p = image({1, 2, 3, 4});
+        p.prefix = true;
+        SavedConversation f = image({1, 2, 3, 4, 5, 6});
+        f.checkpoints = {cp({1, 2, 3, 4})};
+        ConversationCache cache(p.bytes() + f.bytes() - 1, 4);   // one of the two at a time
+        check(cache.put(image({9, 8, 7})), "park an older entry");
+        check(cache.put(std::move(p)), "the prefix entry fits beside it");
+        check(!cache.make_room(f.bytes(), 0, 1), "the full snapshot is refused rather than evicting the fresh prefix");
+        check(cache.size() == 1 && cache.evictions() == 1, "protection evicts the older entry but never the new prefix");
+        check(cache.best(std::vector<int64_t>{1, 2, 3, 4, 9}, {}, true).tokens == 4,
+              "the refused reservation leaves the prefix entry parked");
+        check(cache.make_room(f.bytes(), 0, 0), "the same reservation without protection fits by evicting it instead");
+        check(cache.size() == 0 && cache.evictions() == 2, "and it does: the prefix was the oldest entry left");
+        }
     }
     {
         ConversationCache disabled(0,4), no_slots(1024,0);
@@ -503,6 +564,38 @@ int main() {
         check(conversation_checkpoints_merge(std::move(none), back) && back.empty(), "no checkpoints: nothing to do");
     }
     {
+        // --kv-pool-tokens: the chain moves with the K/V - every checkpoint that is a prefix of the conversation
+        // goes, in order; one of another conversation (or one past it) stays behind for the caller to drop
+        auto ck = [](std::vector<int32_t> ids, uint64_t used) {
+            ConversationCheckpoint c;
+            c.ids = std::move(ids);
+            c.used = used;
+            c.gdn.assign(8, 7);
+            return c;
+        };
+        std::vector<ConversationCheckpoint> from;
+        from.push_back(ck({1, 2}, 1));
+        from.push_back(ck({1, 2, 3, 4}, 2));
+        from.push_back(ck({1, 2, 9, 9}, 3));         // another branch
+        from.push_back(ck({1, 2, 3, 4, 5, 6, 7}, 4));  // past the conversation
+        from.push_back(ck({1, 2, 3, 4, 5}, 5));        // the whole conversation: a prefix
+        std::vector<ConversationCheckpoint> to;
+        to.push_back(ck({1}, 0));                      // what the receiver already holds stays first
+        check(conversation_checkpoints_carry(from, {1, 2, 3, 4, 5}, to) == 3, "carry: three checkpoints are prefixes");
+        check(to.size() == 4 && to[0].used == 0 && to[1].used == 1 && to[2].used == 2 && to[3].used == 5,
+              "carry: they arrive in order after what was there");
+        check(from.size() == 2 && from[0].used == 3 && from[1].used == 4, "carry: the others stay");
+        check(to[3].gdn.size() == 8 && to[3].gdn[0] == 7, "carry: the running state moved with it");
+        ConversationCheckpoint pic = ck({1, 2}, 6);
+        pic.imgs.push_back({1, 77});
+        std::vector<ConversationCheckpoint> with_picture, out;
+        with_picture.push_back(std::move(pic));
+        check(conversation_checkpoints_carry(with_picture, {1, 2, 3}, out) == 0 && out.empty(),
+              "carry: a checkpoint with a picture is not carried");
+        std::vector<ConversationCheckpoint> none, sink;
+        check(conversation_checkpoints_carry(none, {1, 2}, sink) == 0 && sink.empty(), "carry: nothing to move");
+    }
+    {
         // the later stages' retained K/V, kept with the first stage's and limited together
         auto kv = [](size_t n) {
             std::vector<ConversationKv> v(2);
@@ -557,6 +650,61 @@ int main() {
         p2.checkpoints.back().gdn.resize(64, 1);
         check(tiny.put(std::move(p2)), "a pinned one fits an empty cache");
         check(!tiny.put(image({7,8,9})) && tiny.size() == 1, "nothing else fits beside it: parking is refused, the pin stays");
+    }
+    {
+        // the retained reuse image belongs to the conversation it was restored from.  The production bug: with
+        // --kv-pool-tokens a solo request's conversation moved into a batch slot and the session forgot it, the
+        // retained K/V stayed behind, the next request resumed ANOTHER conversation from a different slot, and
+        // that one's next park reused the first conversation's bytes as its own unchanged prefix.
+        auto kv = [](size_t n) { std::vector<ConversationKv> v(1); v[0].k.resize(n, 1); return v; };
+        ConversationCache cache(1 << 20, 4);
+        const std::vector<int32_t> root = {1, 2, 3, 4};              // the system prompt both share
+        const std::vector<int32_t> conv_a = {1, 2, 3, 4, 5, 6, 7, 8};
+        const std::vector<int32_t> conv_b = {1, 2, 3, 4, 9, 10};
+        cache.retain(kv(100), int64_t(conv_a.size()), {}, conv_a);   // A restored, then parked again
+        cache.limit_reuse(int64_t(conv_b.size()));                   // the session now holds B: limit_reuse alone
+        auto r = cache.take_reuse(conv_b, {});                       // would keep A's bytes for B's first 6 cells
+        check(!r.kv.empty() && r.unchanged_tokens == 4,
+              "a park of another conversation reuses only the prefix the two share");
+        cache.retain(kv(100), int64_t(conv_a.size()), {}, conv_a);
+        auto gone = cache.take_reuse();   // the park early-returned: the session holds no conversation at all
+        check(gone.kv.empty() && cache.retained_bytes() == 0, "asking for the reuse with no conversation drops it");
+        cache.retain(kv(100), int64_t(conv_a.size()), {}, conv_a);
+        std::vector<int32_t> grown = conv_a;
+        grown.push_back(9);
+        r = cache.take_reuse(grown, {});
+        check(r.unchanged_tokens == 8, "the same conversation, continued, keeps its retained prefix");
+        cache.retain(kv(100), 8, {}, conv_a);
+        cache.limit_reuse(5);
+        r = cache.take_reuse(conv_a, {});
+        check(r.unchanged_tokens == 5, "the first rewrite still bounds the reuse");
+        cache.retain(kv(100), 8, {}, conv_a);
+        cache.retain(kv(100), 6, {}, conv_b);   // B restored: its bytes, B's identity
+        r = cache.take_reuse(conv_a, {});
+        check(r.unchanged_tokens == 4, "retaining another conversation replaces the identity with it");
+        std::vector<std::vector<ConversationKv>> stage_kv;
+        stage_kv.push_back(kv(50));
+        cache.retain(kv(100), 8, std::move(stage_kv), conv_a);
+        r = cache.take_reuse(conv_b, {});
+        check(r.stages.size() == 1 && r.stages[0].unchanged_tokens == 4,
+              "a later stage's reuse is bounded by the shared prefix too");
+        // the pictures: equal placeholder tokens over different pixels share only the cells before the picture
+        const std::vector<ConversationImageKey> img_a{{2, 111}}, img_b{{2, 222}};
+        cache.retain(kv(100), 4, {}, root, img_a);
+        r = cache.take_reuse(root, img_b);
+        check(r.unchanged_tokens == 2, "the same tokens under different pixels stop at the picture");
+        cache.retain(kv(100), 4, {}, root, img_a);
+        r = cache.take_reuse(root, {});
+        check(r.unchanged_tokens == 2, "a conversation without the picture reuses nothing past its start");
+        cache.retain(kv(100), 4, {}, root, img_a);
+        r = cache.take_reuse(root, img_a);
+        check(r.unchanged_tokens == 4, "the same tokens and the same pixels keep everything");
+        check(conversation_shared_prefix({1, 2, 3}, {}, {1, 2}, {}) == 2, "shared prefix: the shorter prefix");
+        check(conversation_shared_prefix({1, 2, 3}, {}, {1, 9, 3}, {}) == 1, "shared prefix: to the first difference");
+        check(conversation_shared_prefix({1, 2}, {{1, 5}}, {1, 2}, {{1, 5}}) == 2, "shared prefix: equal pictures pass");
+        ConversationCache budgeted(1 << 20, 4);
+        budgeted.retain(kv(100), 8, {}, conv_a);
+        check(budgeted.bytes() > budgeted.retained_bytes(), "the retained identity counts against the budget");
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

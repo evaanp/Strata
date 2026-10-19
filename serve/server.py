@@ -27,6 +27,7 @@ talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes ev
 from __future__ import annotations
 
 import argparse
+import array
 import contextlib
 import collections
 import base64
@@ -361,6 +362,36 @@ class EngineStarting(RuntimeError):
 class ClientGone(Exception):
     """#1999: the client hung up while its request was being prepared (an image URL downloading, a picture encoding or
     waiting for its turn): nothing is left to answer."""
+
+
+class PoolFull(ValueError):
+    """The engine's shared KV pool (--kv-pool-tokens) cannot hold another conversation now: the decoding lanes hold it.
+    Retryable - a 503 with Retry-After, not the 400 of a request that can never fit (that one is refused before the
+    engine sees it)."""
+
+
+POOL_FULL_PREFIX = "KV pool full"
+POOL_RETRY_S = 10
+
+
+def engine_error(msg: str) -> ValueError:
+    """The exception for an engine ERR line: PoolFull for the KV pool's refusal, else ValueError."""
+    return PoolFull(msg) if msg.startswith(POOL_FULL_PREFIX) else ValueError(msg)
+
+
+def common_prefix_len(a: list[int], b: list[int]) -> int:
+    """How many leading tokens the two lists share (slice compares run in C: a 250k-token list takes ~20 of them)."""
+    n = min(len(a), len(b))
+    if a[:n] == b[:n]:
+        return n
+    lo, hi = 0, n               # a[:lo] == b[:lo], a[:hi] != b[:hi]
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if a[:mid] == b[:mid]:
+            lo = mid
+        else:
+            hi = mid
+    return lo
 
 
 class ModelBusy(RuntimeError):
@@ -1097,6 +1128,7 @@ class StrataEngine:
         groups_run = int(self.info.get("batch_groups") or groups)
         self.slot_gs = gs if groups > 1 and groups_run > 1 else 0
         self.slot_q = [queue.Queue() for _ in range(self.batch)]
+        self.pool = None                                # the engine's last POOL line (--kv-pool-tokens)
         self.slot_busy = [False] * self.batch
         # #1603: who owns a busy flag.  slot_claims: slots a request of this server picked or reserved and has not
         # given back; slot_releasing: slots handed to the background BDONE wait.  A busy slot in neither has no owner
@@ -1144,6 +1176,14 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            if line.startswith("POOL "):                # --kv-pool-tokens: the shared KV pool's use, for /metrics
+                f = line.split()
+                try:
+                    self.pool = {"cells": int(f[1]), "free": int(f[2]), "main": int(f[3]),
+                                 "slots": [int(x) for x in f[4].split(",")] if f[4] != "-" else []}
+                except (IndexError, ValueError):
+                    pass
+                continue
             if line.startswith("BSTAT"):
                 sample = parse_batch_window_sample(line)
                 if sample is not None and self.proc is proc:
@@ -1394,7 +1434,17 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
-        return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
+        return keys + StrataEngine.projection_key(sampling) + StrataEngine.conversation_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
+
+    CONVERSATION_ID = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+
+    @staticmethod
+    def conversation_key(sampling: dict) -> str:
+        """`conv=ID`: the client's conversation id (header X-Strata-Conversation or body field strata_conversation).
+        An engine started with --conversation-disk-dir parks only conversations that carry one; an id that is not a
+        plain token is dropped rather than passed on (the GEN line is space-separated)."""
+        cid = sampling.get("strata_conversation")
+        return f" conv={cid}" if isinstance(cid, str) and StrataEngine.CONVERSATION_ID.fullmatch(cid) else ""
 
     @staticmethod
     def projection_key(sampling: dict) -> str:
@@ -1470,7 +1520,7 @@ class StrataEngine:
                     self._yielded = (int(f[1]), int(f[2]))
             elif line.startswith("ERR"):
                 self._ctl_erred = True                   # #1059: the engine refused it and is idle: no DONE follows
-                raise ValueError(line[4:].strip())
+                raise engine_error(line[4:].strip())
             if line.startswith("DONE") and self._ctl_mode == "solo":
                 self._ctl_result = ("done", None)
                 return
@@ -1797,7 +1847,7 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length", "pool") or (out and out[-1] in EOS_IDS):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -2060,6 +2110,7 @@ class StrataEngine:
     slot_groups = 1         # --batch-groups (set when the engine starts)
     SLOT_PREFIX_MIN = 512   # a held prefix shorter than this is not worth unbalancing the pipeline's groups
     TURN_ID = 248045        # <|im_start|>: the engine's default --turn-token (its turn checkpoint sits at the last one)
+    SLOT_REWRITE_MIN = 1024  # a held conversation whose tail was rewritten counts as this prompt's own from this many shared tokens
 
     def pick_slot(self, prompt: list[int]) -> int | None:
         """A free slot for `prompt` (the caller holds slot_cv): the one whose held tokens are the longest start of the
@@ -2092,7 +2143,14 @@ class StrataEngine:
             if len(h) < len(prompt) and prompt[:len(h)] == h:
                 return len(h)
             k = len(h) - 1 - h[::-1].index(self.TURN_ID) if self.TURN_ID in h else 0
-            return k if 0 < k < len(prompt) and prompt[:k] == h[:k] else 0
+            if 0 < k < len(prompt) and prompt[:k] == h[:k]:
+                return k
+            # fork: a client that changed its last question, or re-rendered the reply without its thinking, no longer
+            # holds the slot's tokens as a prefix - but the slot is still THIS conversation's (the engine resumes from
+            # one of its checkpoints), so a second conversation must not take it: at least three quarters of what it
+            # holds is shared (a long system prompt in common is not enough)
+            shared = min(common_prefix_len(h, prompt), len(prompt) - 1)
+            return shared if shared >= self.SLOT_REWRITE_MIN and shared * 4 >= len(h) * 3 else 0
         best = max(free, key=held_prefix)
         # without --batch-groups a held prefix of any length is taken, as before
         if held_prefix(best) >= (self.SLOT_PREFIX_MIN if self.slot_groups > 1 else 1):
@@ -2214,7 +2272,7 @@ class StrataEngine:
                     return
                 elif line.startswith("ERR"):
                     done = True
-                    raise ValueError(line[4:].strip())
+                    raise engine_error(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
                 if self.can_stop:
@@ -2474,10 +2532,26 @@ def vision_start_error(line: str, log=None) -> str:
     return "the vision encoder did not start: " + text
 
 
+def _free_vram_mib(index: int) -> int | None:
+    """Free VRAM on one card, from NVML (AMD backend: amdgpu's sysfs, #301); None when it can't be read.
+
+    `Service.free_vram_mib()` asks the same of the engine's card.  This one takes the index because the encoder
+    and the engine can be on different cards (the config's own `cuda_device`, #408) - and because the encoder is
+    asked at a moment when the engine is not loaded yet.  It goes through telemetry's reader."""
+    try:
+        from serve.telemetry import free_vram_mib
+        return free_vram_mib(int(index or 0))
+    except Exception:  # noqa: BLE001 - telemetry must never take the server down
+        return None
+
+
 class Vision:
     """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once."""
+
+    device = 0                  # class defaults so `__new__`-built instances stay readable
+    mib: int | None = None
 
     @staticmethod
     def work_dir() -> Path:
@@ -2499,7 +2573,7 @@ class Vision:
                 pass
         return Path(tempfile.mkdtemp(prefix="strata-vision-"))
 
-    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
+    def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False, device: int = 0):
         args = self.reader_args(cfg)
         self.dir = self.work_dir()
         self.spawn = (args, log, env)                   # to start it again after an unload
@@ -2507,6 +2581,11 @@ class Vision:
         # fall back on when it does not start; _start switches to it by itself
         cpu = vision_reader.cpu_fallback(cfg)
         self.fallback = (self.reader_args(cpu), log, env) if cpu else None
+        # There is no device flag to pass: mtmd takes device 0 of CUDA_VISIBLE_DEVICES, which child_env builds
+        # from the config's own GPU list (or vision_env pins one card, #408), so this is the card the encoder
+        # lands on.  Kept so the Monitor can show its footprint on that card rather than on the engine's.
+        self.device = int(device or 0)
+        self.mib: int | None = None                     # the VRAM it holds; None = not measured
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -2551,6 +2630,11 @@ class Vision:
 
     def _start_reader(self):
         args, log, env = self.spawn
+        # The encoder is a separate process and reports no memory of its own - not in its stdout, not in its log -
+        # so its footprint is what this card's free VRAM lost while it started.  It runs a 2048px warm-up before
+        # printing READY (tools/vision/strata_vision.cpp), so every buffer it will ever need is already allocated
+        # by the time `after` is read.
+        before = _free_vram_mib(self.device)
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         self.proc = popen("the image encoder", args, role="vision", stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
@@ -2570,6 +2654,13 @@ class Vision:
                 pass
             raise RuntimeError(vision_start_error(line, self.spawn[1]))
         self.stopped = False
+        after = _free_vram_mib(self.device)
+        # A real encoder is hundreds of MiB to ~1.5 GB (docs/DETAILS.md quotes ~1.4 GB, setup reserves 700 MiB), so
+        # anything outside 64..8192 is noise rather than this process: a CPU-mode encoder takes no VRAM at all, an
+        # unreadable card gives None, and on a restart the killed process has not released its memory yet.
+        if before is not None and after is not None and 64 <= before - after <= 8192:
+            self.mib = before - after
+        # Otherwise the last good reading stands.  A wrong number here is worse than no number.
 
     def _readline(self, timeout: float, what: str) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the
@@ -3211,6 +3302,73 @@ class ByteTokenizer:
         return raw.decode("utf-8", errors=errors)
 
 
+class SampledTails:
+    """The ids the engine holds for each conversation (its prompt plus what it sampled), so a client that sends the
+    same text back gets the same ids back.
+
+    A model can sample a split the tokenizer would never produce (a rare character as two tokens where the
+    vocabulary has one).  The client renders that text again, the tokenizer merges it, and from that token on the
+    prompt no longer continues the engine's live end: the engine falls back to its last checkpoint and reads
+    thousands of tokens again (6834 after a 16K-character tool call, 2026-10-02).  `splice` puts the sampled ids
+    back wherever the bytes are the same.  Only with a tokenizer that has `token_bytes`: comparing decoded text
+    would call two different halves of a character equal (both decode to U+FFFD)."""
+
+    def __init__(self, keep: int = 32):
+        self.keep, self.held = keep, collections.OrderedDict()
+
+    def record(self, conversation: str, ids: list[int]):
+        self.held[conversation] = array.array("i", ids)   # 4 bytes a token, not a list's ~36
+        self.held.move_to_end(conversation)
+        while len(self.held) > self.keep:
+            self.held.popitem(last=False)
+
+    def splice(self, conversation: str, ids: list[int], tok) -> list[int]:
+        held = self.held.get(conversation)
+        token_bytes = getattr(tok, "token_bytes", None)
+        if not held or token_bytes is None:
+            return ids
+        d = 0
+        for a, b in zip(held, ids):
+            if a != b:
+                break
+            d += 1
+        if d == len(held) or d == len(ids):
+            return ids
+        # walk both from the first different id; (j, k) is the last point where both sides have produced the same
+        # bytes and end on a token boundary
+        i, k, best = d, d, None
+        mine, theirs = b"", b""
+        while True:
+            if len(mine) == len(theirs):
+                if mine != theirs:
+                    break
+                if i > d:
+                    best = (i, k)
+                mine = theirs = b""
+                if i == len(held) or k == len(ids):
+                    break
+                mine, theirs = token_bytes(held[i]), token_bytes(ids[k])
+                i, k = i + 1, k + 1
+            elif len(mine) < len(theirs):
+                if i == len(held) or not theirs.startswith(mine):
+                    break
+                mine += token_bytes(held[i])
+                i += 1
+            else:
+                if k == len(ids) or not mine.startswith(theirs):
+                    break
+                theirs += token_bytes(ids[k])
+                k += 1
+        if best is None:
+            return ids
+        j, k = best
+        window = lambda xs, at: ",".join(str(x) for x in xs[max(0, at - 4):at]) + "|" + \
+            ",".join(str(x) for x in xs[at:at + 8])
+        print(f"[strata] conversation {conversation or '-'}: kept {j - d} sampled ids for {k - d} the prompt had at "
+              f"{d} of {len(ids)}; sampled={window(held, d)} prompt={window(ids, d)}", flush=True)
+        return ids[:d] + held[d:j].tolist() + ids[k:]
+
+
 # ------------------------------------------------------------------------------------------------ core
 class Detokenizer:
     """Incremental decode: each token's bytes go through an incremental UTF-8 decoder, which emits the complete
@@ -3380,6 +3538,7 @@ class Service:
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
         self.status = {"busy": False, "queued": 0}      # GET /status: what the model is doing right now
+        self.tails = SampledTails()                     # the sampled ids per conversation (see SampledTails)
         self.rate = collections.deque(maxlen=32)        # (time, generated) samples for the live tok/s window
         # "parallel" (the engine's batch slots): every running request's own status and rate window; self.status
         # then says busy while any runs and shows the newest one
@@ -3741,6 +3900,22 @@ class Service:
                 except Exception as e:                 # tried again at the next turn; the thread keeps running
                     print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
+
+    def vision_metrics(self) -> dict:
+        """The encoder's line in /metrics: configured or not, process up or not, and which card holds it with how
+        much VRAM.  Everything is `getattr`, because a test stands a bare double in for the encoder (test_server
+        has one with only `encode`) and the Monitor must not depend on what that double happens to implement."""
+        v = self.vision
+        if v is None:
+            return {"enabled": False, "running": False, "device": None, "mib": None}
+        alive = getattr(v, "alive", None)
+        running = True if alive is None else bool(alive())
+        # `device` is a config index - the same numbering as hardware.gpus[].index - so the Monitor can put the row
+        # on the card whose NVML index matches.  `mib` is reported only while the process is up: an unloaded
+        # encoder really has given its VRAM back, and showing the last measurement next to a stopped process would
+        # read as if it were still holding it.
+        return {"enabled": True, "running": running, "device": getattr(v, "device", None),
+                "mib": getattr(v, "mib", None) if running else None}
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's (first) GPU, from the backend's reader - NVML, the amdgpu sysfs files (#301) or
@@ -4117,6 +4292,8 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
+        if getattr(self.engine, "pool", None):         # --kv-pool-tokens: cells in all, free, held by each session
+            live["kv_pool"] = self.engine.pool
         par = int(getattr(self.engine, "batch", 0) or 0)
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
@@ -4135,7 +4312,8 @@ class Service:
                   **dict(getattr(self.engine, "info", {}) or {})}
         tel = self.telemetry.snapshot() if getattr(self, "telemetry", None) else {"now": {}, "history": {}, "static": {}}
         parked = self.conv_log.poll(getattr(self.engine, "log_path", None), getattr(self.engine, "log_start", None))
-        return {"engine": engine, "live": live, "requests": hist[::-1][:None if all_requests else 12],
+        return {"engine": engine, "vision": self.vision_metrics(), "live": live,
+                "requests": hist[::-1][:None if all_requests else 12],
                 "conversation_cache": conversation_cache_view(engine, hist, totals, parked),
                 "requests_kept": len(hist), "totals": totals, "hardware": tel["now"],
                 "hardware_static":
@@ -4607,6 +4785,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
+        truncated = False
         raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
@@ -4713,7 +4892,16 @@ class Service:
                         rate.clear()                    # the previous request's samples must not leak into this one
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
-                    prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    conversation = str((sampling or {}).get("strata_conversation") or "")
+                    prompt, thought = self.tails.splice(conversation, ids, self.tok), 0   # thought: the reasoning
+                    # thought: the reasoning tokens so far (the budget's).  The budget was cut for `ids`; a
+                    # splice that puts back more sampled ids than the tokenizer's merges makes the prompt longer,
+                    # and a client that asks for exactly the room left (PLA does) then went over by those few
+                    # tokens: the engine refused the request (conv 60158, 2026-10-03:
+                    # 51349 + 102244 + 8 > 153600).  Give them up from max_new.
+                    over = len(prompt) + max_new + CTX_SLACK - getattr(self.engine, "max_context", 1 << 62)
+                    if over > 0 and len(prompt) > len(ids):
+                        max_new -= min(over, len(prompt) - len(ids))
                     for ev in opening:
                         yield "event", ev
                     while True:
@@ -4754,6 +4942,7 @@ class Service:
                                         break
                                     finish = "stop"
                                     raw_ids.append(t)
+                                    seg.append(t)           # sampled like the rest (SampledTails)
                                     break
                                 raw_ids.append(t)
                                 seg.append(t)
@@ -4943,6 +5132,8 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "strata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                    else:                               # a cancelled request leaves the engine without a live end
+                        self.tails.record(conversation, prompt + seg)
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -4953,6 +5144,8 @@ class Service:
                         if st.get("busy") and not timed_out:
                             last = request_stats(segments)          # only this request's own DONEs count
                             started = st.get("started", time.time())
+                            # the engine's KV pool (--kv-pool-tokens) was full: ended short of what was asked
+                            truncated = last.get("finish") == "pool"
                             cvec = (getattr(self.engine, "info", {}) or {}).get("cvec", 0)
                             loaded = str(cvec) not in ("0", "", "None")
                             hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -5058,7 +5251,7 @@ class Service:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
                 "timings": timings, "reasoning_tokens": thinking_n,
-                "reasoning_recoveries": recovery_count}
+                "reasoning_recoveries": recovery_count, "truncated": truncated}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
         yield "done", done
@@ -5094,7 +5287,6 @@ def add_carry(carry: dict, last: dict) -> dict:
     if "prompt_read" in carry:
         out["prompt_read"] = carry["prompt_read"]
     return out
-
 
 def request_timings(prompt_tokens: int, generated: int, last: dict) -> dict | None:
     """One request's `timings` in llama.cpp's names (what its clients show as speed), from the engine's own clock
@@ -5331,6 +5523,8 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
                              "prompt_tokens_details": {"cached_tokens": x.get("reused") or 0}}
             if x.get("timings"):
                 last["timings"] = x["timings"]          # llama.cpp's field: the speed its clients show
+            if x.get("truncated"):
+                last["truncated"] = True                # llama.cpp's field: ended short of what was asked
             yield last
 
 
@@ -5375,6 +5569,8 @@ def openai_collect(chunks) -> dict:
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if last.get("truncated"):
+        out["truncated"] = True
     return out
 
 
@@ -6252,6 +6448,9 @@ def make_handler(svc: Service):
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                    cid = self.headers.get("X-Strata-Conversation")
+                    if cid:
+                        req["strata_conversation"] = cid.strip()
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
@@ -6272,12 +6471,21 @@ def make_handler(svc: Service):
                     self._count_tokens(req)
                 elif path == "/v1/images/generations":
                     self._images(req)
+                elif path in ("/tokenize", "/detokenize", "/apply-template"):
+                    self._tokenizer_route(path, req)
                 else:
                     self._json(404, {"error": {"message": "not found"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
+            except PoolFull as e:                            # retryable: the pool frees as the lanes finish
+                retry = {"Retry-After": str(POOL_RETRY_S)}
+                if path == "/v1/responses":
+                    self._json(503, responses_error_body(str(e), "server_error", code="kv_pool_full"), retry)
+                else:
+                    self._json(503, {"error": {"type": "server_error", "code": "kv_pool_full", "message": str(e)}},
+                               retry)
             except ValueError as e:
                 print(f"[strata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
@@ -6631,6 +6839,8 @@ def make_handler(svc: Service):
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started: the
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
+                if isinstance(e, PoolFull):                  # nor a 503: the code and the wait go in the event
+                    err["error"].update(code="kv_pool_full", retry_after=POOL_RETRY_S)
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
@@ -6701,6 +6911,9 @@ def make_handler(svc: Service):
                                                                 code="server_error"))
                 except EngineNonFinite as e:                 # #879, twice: not the request's fault
                     return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                except PoolFull as e:
+                    return self._json(503, responses_error_body(str(e), "server_error", code="kv_pool_full"),
+                                      {"Retry-After": str(POOL_RETRY_S)})
                 except ValueError as e:                      # the engine's ERR line
                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
                 return self._json(200, result)
@@ -6736,7 +6949,7 @@ def make_handler(svc: Service):
             except StructuredOutputError as e:
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
-                self._responses_failed(asm, str(e), "server_error", send)
+                self._responses_failed(asm, str(e), "kv_pool_full" if isinstance(e, PoolFull) else "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
             e = asm.failed(message, code)
@@ -6816,6 +7029,38 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
+        def _tokenizer_route(self, path, req):
+            """llama-server's /tokenize, /detokenize and /apply-template, so a client can see the ids and the prompt
+            this server reads without running the model (the tokenizer and template live here, not in the engine)."""
+            if path == "/tokenize":
+                content = req.get("content")
+                if not isinstance(content, str):
+                    raise ValueError("'content' must be a string")
+                # JSON may carry half of a surrogate pair (a client that cut a string inside an emoji: PLA's in-turn
+                # fold did, and a 400 here made it estimate characters / 4 exactly when the window fit mattered).
+                # Count it as one replacement character, and say where it was so the client can be fixed.
+                clean = content.encode("utf-8", "replace").decode("utf-8")
+                if clean != content:
+                    at = next(i for i, c in enumerate(content) if 0xD800 <= ord(c) <= 0xDFFF)
+                    print(f"[strata] /tokenize: a lone surrogate at {at} of {len(content)}, counted as one character: "
+                          f"{content[max(0, at - 60):at + 20].encode('utf-8', 'backslashreplace').decode()!r}", flush=True)
+                ids = svc.tok.encode(clean, parse_special=req.get("parse_special", True) is not False)
+                if req.get("with_pieces"):
+                    self._json(200, {"tokens": [{"id": t, "piece": svc.tok.decode([t])} for t in ids]})
+                else:
+                    self._json(200, {"tokens": ids})
+            elif path == "/detokenize":
+                ids = req.get("tokens")
+                if not isinstance(ids, list) or not all(isinstance(t, int) and not isinstance(t, bool) for t in ids):
+                    raise ValueError("'tokens' must be a list of token ids")
+                try:
+                    self._json(200, {"content": svc.tok.decode(ids)})
+                except (IndexError, KeyError) as e:
+                    raise ValueError(str(e)) from None
+            else:
+                messages, tools, kw = openai_to_messages(svc.with_shared(req, "openai"))
+                self._json(200, {"prompt": svc.template.render(messages, tools=tools, **kw)})
+
         def _anthropic(self, req):
             svc.load()
             req = svc.with_shared(req, "anthropic")
@@ -6860,7 +7105,9 @@ def make_handler(svc: Service):
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started
-                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
+                # the KV pool's refusal is Anthropic's overloaded_error: its clients retry that one
+                kind = "overloaded_error" if isinstance(e, PoolFull) else "api_error"
+                err = {"type": "error", "error": {"type": kind, "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
 
@@ -7748,7 +7995,11 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+                            env=vision_env(cfg, env), lazy=lazy,
+                            # the card the encoder lands on: the config's own `cuda_device` when it names one
+                            # (#408), else child_env's first GPU - the Monitor shows its footprint there
+                            device=(vcfg.get("cuda_device") if vcfg.get("cuda_device") is not None
+                                    else (gpu_list(cfg) or [0])[0]))
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080

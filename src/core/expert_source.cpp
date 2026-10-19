@@ -3741,6 +3741,30 @@ bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
     return resident_blob(index) != nullptr;
 }
 
+int64_t FileExpertSource::lock_mapped_expert(int64_t layer, int64_t expert, bool lock, bool prev_locked,
+                                             bool next_locked) {
+#if defined(_WIN32)
+    (void) layer; (void) expert; (void) lock; (void) prev_locked; (void) next_locked;
+    return -1;
+#else
+    if (role_ptr_.empty() || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return -1;
+    const uintptr_t pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+    const auto down = [pg](uintptr_t x) { return x & ~(pg - 1); };
+    const auto up = [pg](uintptr_t x) { return (x + pg - 1) & ~(pg - 1); };
+    int64_t bytes = 0;
+    for (int r = 0; r < 3; ++r) {
+        const size_t i = (size_t) (3 * layer + r);
+        const uintptr_t p = (uintptr_t) (role_ptr_[i] + (size_t) ((uint64_t) expert * role_bytes_[i]));
+        const uintptr_t end = p + (uintptr_t) role_bytes_[i];
+        const uintptr_t a = lock || !prev_locked ? down(p) : up(p);
+        const uintptr_t b = lock || !next_locked ? up(end) : down(end);
+        if (b > a && (lock ? ::mlock((void*) a, b - a) : ::munlock((void*) a, b - a)) != 0) return -1;
+        bytes += (int64_t) role_bytes_[i];
+    }
+    return bytes;
+#endif
+}
+
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce) {
     err.clear();
     if (n <= xstage_cap_) return true;
@@ -4420,27 +4444,32 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
-        // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
-        // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
+        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a MISSED entry routed
+        // only at rank >= R (the smallest weights of the top-10) contributes zero, without renormalisation (the
+        // others keep the weight the router gave them).  Less PCIe and CPU work.  P14h: the decision is PER
+        // ENTRY, never per expert-window.  The old joint rule (skip an expert iff EVERY row of the window
+        // routes it weakly) made row 0's expert set depend on row 1's routing: row 0 of a T>1 window then
+        // differed from the T=1 chain by ~0.7 logit at the same position with the same committed prefix
+        // (evidence/2026-10-13-p14h-rmatrix).  An expert is fetched iff at least one of its entries survives.
         const int tail_rank = tail_skip_rank();
-        bool skip_d[kMaxWindowEntries];
-        for (int q = 0; q < nd; ++q) skip_d[q] = false;
+        bool skip_e[kMaxWindowEntries];       // per entry: this entry's contribution is zero
+        for (int64_t i = 0; i < n; ++i) skip_e[i] = false;
         if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
-            int minr[kMaxWindowEntries];
-            for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
-                int q = 0;
-                while (q < nd && distinct[q] != first_of[i]) ++q;
-                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
-            }
-            for (int q = 0; q < nd; ++q) {
-                const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                const int32_t e = ids[i];
+                if (e < 0 || e >= d.n_expert || (int) (i % k) < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
-                skip_d[q] = true;
-                --nmiss;
-                ++d.tail_experts;
+                skip_e[i] = true;
+            }
+            for (int q = 0; q < nd; ++q) {   // an expert whose every entry is skipped is not fetched at all
+                const int64_t i0 = distinct[q];
+                const int32_t e = ids[i0];
+                if (e < 0 || e >= d.n_expert) continue;
+                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // not a miss
+                bool any = false;
+                for (int64_t i = i0; i < n; ++i)
+                    if (first_of[i] == i0 && !skip_e[i]) { any = true; break; }
+                if (!any) { --nmiss; ++d.tail_experts; }
             }
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
@@ -4460,7 +4489,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
-            if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
+            bool all_skip = true;                  // STRATA_ROUTE_TAIL_SKIP: every entry zero -> neither copied nor computed
+            for (int64_t i = i0; i < n; ++i)
+                if (first_of[i] == i0 && !skip_e[i]) { all_skip = false; break; }
+            if (all_skip) {
                 for (int64_t i = i0; i < n; ++i)
                     if (first_of[i] == i0) kind[i] = -2;
                 continue;
@@ -4475,6 +4507,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     kd = 2;                        // multi-GPU: the second GPU computes it
                 } else if (helper_holds(e)) {
                     // left to the helper: kind -1 until RemoteExperts::begin() claims the row (see above)
+                } else if (d.staged != nullptr && d.staged(d.staged_ctx, d.layers, e, &ptr)) {
+                    kd = 0;                        // M3-S1: a predicted row staged in VRAM. The hook waited
+                                                   // for its copy before answering, so this is a GPU group like
+                                                   // a hit - the use is decided by prediction and routing, the
+                                                   // copy's lateness only costs the layer a measured wait.
                 } else if (d.fs != nullptr && d.fs->take(d.layers, e, ptr)) {
                     kd = 0;                        // Foresight: a landed swap-space slot holds it - a GPU group like a hit
                 } else {
@@ -4492,12 +4529,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd;
+                if (first_of[i] == i0) kind[i] = skip_e[i] ? -2 : kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
+                if (first_of[i] == i0 && !skip_e[i]) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;
@@ -4512,7 +4549,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                  : P.staging + (unsigned long long) q * (unsigned long long) bb;
             P.start2[q] = entries;
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) {
+                if (first_of[i] == i0 && !skip_e[i]) {
                     P.dst[entries] = (int32_t) i;
                     P.tok[entries] = (int32_t) (i / k);
                     ++entries;
