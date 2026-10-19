@@ -17,7 +17,9 @@ function(strata_ggml_tq_overlay LLAMA OUT)
   set(STRATA_TQ_OVERLAY_OK OFF PARENT_SCOPE)
   set(_cu "${LLAMA}/ggml/src/ggml-cuda")
   set(_inc "${LLAMA}/ggml/include")
-  set(_tq "${CMAKE_SOURCE_DIR}/third_party/ggml-tq")
+  # CMAKE_CURRENT_SOURCE_DIR, not CMAKE_SOURCE_DIR: the fork is also added as a
+  # subproject (sexec), where the top-level source dir is the consumer's.
+  set(_tq "${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml-tq")
   foreach(_f "${_inc}/ggml.h" "${_cu}/mmq.cuh" "${_cu}/mmq-load-tiles.cuh" "${_cu}/common.cuh")
     if(NOT EXISTS "${_f}")
       message(STATUS "trellis MMQ overlay: ${_f} is missing: off")
