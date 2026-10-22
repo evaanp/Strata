@@ -231,6 +231,12 @@ public:
     // a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while stage k+1
     // runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share a hand-off row.
     bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// batch_launch with the caller's rows (a slot may own a group: head + drafts) and the hand-off row base. With
+    /// `commit_all` false nothing is committed: no keep-every-row commit is queued and ple_prev stays, so the caller
+    /// commits the accepted prefix with commit_slot_prefixes once the last stage's picks are known - or drops the
+    /// window. (Two sequences pipelined across a layer split, each on its own verifier set: sexec.)
+    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                           bool commit_all, std::string& err);
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
