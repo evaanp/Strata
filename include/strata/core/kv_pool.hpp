@@ -15,6 +15,12 @@
 // stage's session reads a copy of it in its own GPU's memory. Reserving, shrinking and swapping act on the lane,
 // named by any of its sessions.
 //
+// Lazy mode (init's `lazy`): the pool's arrays are address space only. A chunk's pages are pinned when a lane is
+// handed the chunk and given back to the kernel (unpinned, MADV_DONTNEED) when the chunk returns to the pool, so the
+// RAM the pool holds follows the conversations, not the context the lanes could reach. The arrays keep their
+// addresses, so the tables and the graphs see no difference; the kernels' mapped pointer is the host pointer (the
+// mode needs cudaDevAttrCanUseHostPointerForRegisteredMem on every stage). fp16 K/V only.
+//
 // The pool only hands out and takes back chunks (kv_chunks.hpp decides which). Who gives way when it runs out is
 // the server loop's call (generate.cpp): an idle slot's cached conversation first, then the request that needs
 // the room.
@@ -43,7 +49,8 @@ public:
 
     /// Pins the pool for the streamed QSA layers of the stages' reference sessions (built with
     /// qsa_set_kv_shared_host): `tokens` cells per layer, rounded up to whole chunks, plus the trash chunk.
-    bool init(const ModelGeometry& g, const std::vector<StageRef>& stages, int64_t tokens, std::string& error);
+    bool init(const ModelGeometry& g, const std::vector<StageRef>& stages, int64_t tokens, std::string& error,
+              bool lazy = false);
     bool active() const { return map_.active(); }
 
     /// Opens a lane with `ss` as its stage-0 session: gives the session's streamed QSA states the pool's arrays and
@@ -57,11 +64,14 @@ public:
     void detach(const SessionState& ss);
 
     /// Backs cells [0, cells) of the lane with pool chunks. False, with nothing changed, when the free chunks
-    /// do not cover it.
+    /// do not cover it (lazy: or the RAM to pin them is not there).
     bool reserve(const SessionState& ss, int64_t cells);
+    /// The bytes reserve(ss, cells) would pin (lazy; 0 otherwise): the caller makes room first.
+    uint64_t pin_bytes_for(const SessionState& ss, int64_t cells) const;
     /// Every chunk of the lane back to the pool.
     void release(const SessionState& ss) { shrink(ss, 0); }
-    /// The lane's chunks past the one holding cell `cells - 1` back to the pool.
+    /// The lane's chunks past the one holding cell `cells - 1` back to the pool (lazy: their RAM back to the
+    /// kernel, so nothing may still read or write them - the caller has synced the lane's streams).
     void shrink(const SessionState& ss, int64_t cells);
     /// Exchanges the chunks of two lanes (the same context length): a conversation's K/V changes session without a
     /// byte copied. Their VRAM residency maps still name the old blocks - reset both (kv_stream_reset).
@@ -72,6 +82,9 @@ public:
     int64_t total_cells() const { return map_.n_chunks() * chunk_cells(); }
     int64_t chunk_cells() const { return page_size_ << kChunkShift; }
     uint64_t pinned_bytes() const { return pinned_bytes_; }
+    bool lazy() const { return lazy_; }
+    /// One chunk's bytes over every streamed layer of every stage.
+    uint64_t chunk_bytes() const { return chunk_bytes_; }
     /// Counts the changes to the chunk tables (the server reports the pool when it changes).
     uint64_t version() const { return map_.version(); }
 
@@ -91,10 +104,20 @@ private:
     bool upload(const Lane& lane);
     bool bind(Lane& lane, SessionState& ss, size_t stage, std::string& error);
     void uploaded_or_die(const Lane& lane);
+    bool pin_chunk(int32_t c);
+    void unpin_chunk(int32_t c);
 
     KvChunkMap map_;
     int64_t page_size_ = 0;
     uint64_t pinned_bytes_ = 0;
+    bool lazy_ = false;
+    uint64_t chunk_bytes_ = 0;
+    struct Region {                  ///< lazy: one array's address space (K or V of a layer)
+        uint8_t* base = nullptr;
+        uint64_t chunk = 0;          ///< bytes per chunk
+    };
+    std::vector<Region> regions_;
+    std::vector<uint8_t> pinned_;    ///< lazy: by pool chunk, the trash chunk included
     struct StageLayers {
         int64_t qsa_ord0 = 0;
         int device = -1;
